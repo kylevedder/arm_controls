@@ -11,7 +11,7 @@ treat a SocketCAN interface (typically a Linux vcan device) as a live arm:
 * optionally, a passive trigger encoder (YAM teaching handle) answers the
   ``[0xFF, 0x02]`` poll on ``encoder_id + 1`` with the big-endian ``!BhhB``
   payload (device_id, position ticks, velocity ticks/s, button bits), and
-  emulates the i2rt firmware/version/EEPROM startup handshake.
+  emulates the firmware/version/EEPROM startup handshake.
 
 Byte layouts mirror ServoDm::can_frame_to_command_dm_servo and
 ServoDm::parse_dm_servo_status in native/arm_controls/src/arm_controls_servo_dm.cpp, and
@@ -41,9 +41,9 @@ _CAN_FRAME = struct.Struct("=IB3x8s")
 _RESPONSE_ID_OFFSET = 0x10  # motor N replies on CAN id N + 0x10
 _BROADCAST_ID = 0x7FF
 
-# YAM teaching-handle passive encoder (mirrors i2rt PassiveEncoderReader).
+# YAM teaching-handle passive encoder protocol.
 _ENCODER_POLL = b"\xff\x02"
-_ENCODER_RESTART = b"\xff\x0f"  # i2rt REQ_RESTART: reboots the handle MCU
+_ENCODER_RESTART = b"\xff\x0f"  # REQ_RESTART: reboots the handle MCU
 _ENCODER_SET_REPORT_FREQUENCY = 0x01
 _ENCODER_GET_VERSION = 0x03
 _ENCODER_SET_ADC_FREQUENCY = 0x04

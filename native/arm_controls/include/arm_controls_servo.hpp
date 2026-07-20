@@ -352,7 +352,7 @@ class Servo {
     /*!
      * @brief Gets the adjusted position derivative gain.
      *
-     * i2rt bilateral teleoperation uses a weak position spring with zero
+     * Bilateral teleoperation uses a weak position spring with zero
      * derivative gain. Keeping the full configured damping on a leader makes
      * normal hand motion feel much stiffer than the requested bilateral gain
      * implies. Move-to-ready and recovery retain the configured damping.

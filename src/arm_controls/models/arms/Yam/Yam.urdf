@@ -148,7 +148,7 @@
   </link>
   <!-- Link end_link -->
   <link name="end_link">
-    <!-- Massless flange, mirroring i2rt's bare-arm link6 (mass 1e-6): the
+    <!-- Massless flange, matching the bare-arm link6 reference (mass 1e-6): the
          attached effector's inertia comes from its <effector_model>_mass.json
          via AlgoPino::append_effector_mass. The crank-gripper inertial that
          used to be baked in here double-counted the gripper for followers

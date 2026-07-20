@@ -31,7 +31,7 @@ ReturnCode DeviceEffectorArx::move_joint_with_torque(Joint* p_joint, float targe
     // sent as a torque-only command (kp=0; the servo's kd supplies damping).
     // A gripper blocked by a wide object saturates at the bound and squeezes
     // with that bounded force indefinitely instead of grinding at full motor
-    // current (the i2rt failure mode: overheated gripper motors, snapped
+    // current (a known failure mode: overheated gripper motors, snapped
     // fingers). The torque is linear and continuous through zero error --
     // saturation only flattens the tails -- so nothing sign-flips or chatters
     // near the target. Match the established non-L5 ARX command ramp: initialize at

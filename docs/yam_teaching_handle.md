@@ -3,8 +3,8 @@
 Status: **implemented in `arm_controls_node`** (`ServoCanPassiveEncoder`,
 servo model `"CAN Passive Encoder"`). The Python API surface (`InputState`,
 `LeaderArm.read_inputs`, the `E_Yam_Handle` input layout) was already complete;
-this document captures the handle protocol from the i2rt reference
-implementation (`i2rt/motor_drivers/dm_driver.py`, `PassiveEncoderReader`) and
+this document captures the handle protocol from the reference
+`PassiveEncoderReader` implementation and
 now describes the shipped behavior.
 
 ## Hardware
@@ -19,7 +19,7 @@ There is no joystick and no actively driven gripper on the leader.
 
 ## CAN protocol (request/response poll)
 
-- Required startup configuration (mirrors i2rt
+- Required startup configuration (mirrors the reference
   `PassiveJointEncoder.validate_encoders`):
   - Query firmware with `[0xFF, 0x03]` on the request CAN id and require
     version `>=2.2.12`.
@@ -34,20 +34,20 @@ There is no joystick and no actively driven gripper on the leader.
     firmware is a hard startup failure.
 - Request: send a 2-byte frame `[0xFF, 0x02]` to the encoder's CAN id
   (arbitration id = encoder id; the response arrives on the same id, or id+1
-  depending on firmware receive mode — i2rt default is `plus_one`). YAM
+  depending on firmware receive mode — the default is `plus_one`). YAM
   handles ship with the fixed encoder id `0x50E` (request) / `0x50F`
-  (response) — i2rt `encoder_manager.py` `REQ`/`REPORT`.
+  (response), matching the firmware's request/report exchange.
 - Response payload, big-endian `!B h h B` (6 bytes):
 
   | field          | type | meaning                                        |
   |----------------|------|------------------------------------------------|
-  | device_id      | u8   | logical device id — observed 0 on hardware regardless of CAN id; do not validate (i2rt ignores it) |
+  | device_id      | u8   | logical device id — observed 0 on hardware regardless of CAN id; do not validate |
   | position       | i16  | encoder ticks; radians = ticks * 2π / 4096     |
   | velocity       | i16  | ticks/s; rad/s = ticks * 2π / 4096             |
   | digital_inputs | u8   | bit 0 = button 0 (top), bit 1 = button 1 (bottom) |
 
-- Trigger normalization (i2rt convention): clip position to ±`range_rad`
-  (0.7 rad) and map `|position| / range_rad` to `[0, 1]`. The i2rt consumer
+- Trigger normalization: clip position to ±`range_rad`
+  (0.7 rad) and map `|position| / range_rad` to `[0, 1]`. The downstream consumer
   then inverts (`1.0 - position`) to make the value open-positive, and divides
   by a per-handle `trigger_closed_position` calibration scalar before
   clipping. In `arm_controls` both live natively: the inversion is `open_at_min` on the
@@ -74,12 +74,12 @@ implements the servo model `"CAN Passive Encoder"`:
   correction failure aborts startup before the first motor-enable frame.
 - **Polling.** `read_hardware_values()` snapshots the driver cache and
   advances a bounded poll state machine. At most one poll is outstanding,
-  normal requests are capped at i2rt's 250 Hz cadence (4 ms minimum spacing),
+  normal requests are capped at the reference 250 Hz cadence (4 ms minimum spacing),
   and a request that misses its 10 ms response deadline triggers a 500 ms
   retry backoff. This remains correct when generic effector code reads the
   cached joint more than once per control loop. `DriverArx` routes responses
   by an explicitly registered CAN id (`response_can_id`, default `id + 1`
-  for the i2rt `plus_one` firmware receive mode) ahead of the DM/ENCOS
+  for the `plus_one` firmware receive mode) ahead of the DM/ENCOS
   heuristics.
 - **Read-only.** The servo never sends enable/MIT/zero frames; `move()` and
   `apply_torque()` are no-ops, and `start_hardware()` proves presence purely

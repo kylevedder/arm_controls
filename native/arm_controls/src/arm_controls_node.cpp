@@ -88,15 +88,15 @@ int main(int argc, char** argv) {
             return -1;
         }
 
-        int capability_flags = ARM_CONTROLS_CONTROL_CAP_MOVE_TO_READY;
+        int capability_flags = ARM_CONTROLS_CAP_MOVE_TO_READY;
         if (cla.role == Role::FOLLOWER) {
-            capability_flags |= ARM_CONTROLS_CONTROL_CAP_DIRECT_COMMAND | ARM_CONTROLS_CONTROL_CAP_LIVE_INPUT;
+            capability_flags |= ARM_CONTROLS_CAP_DIRECT_COMMAND | ARM_CONTROLS_CAP_LIVE_INPUT;
         } else {
-            capability_flags |= ARM_CONTROLS_CONTROL_CAP_GRAVITY_COMP | ARM_CONTROLS_CONTROL_CAP_FORCE_FEEDBACK;
+            capability_flags |= ARM_CONTROLS_CAP_GRAVITY_COMP | ARM_CONTROLS_CAP_FORCE_FEEDBACK;
         }
         std::vector<int> handshake_data{
-            ARM_CONTROLS_CONTROL_PROTOCOL_VERSION_MAJOR,
-            ARM_CONTROLS_CONTROL_PROTOCOL_VERSION_MINOR,
+            ARM_CONTROLS_PROTOCOL_VERSION_MAJOR,
+            ARM_CONTROLS_PROTOCOL_VERSION_MINOR,
             capability_flags,
         };
 

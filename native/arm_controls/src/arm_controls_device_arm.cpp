@@ -620,7 +620,7 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
     ARM_CONTROLS_INFO("DeviceArm", InfoLevel::HELPFUL_1, "DeviceArm %s_%s: SERVO_NUM_TOTAL=%d", model_.c_str(), id_.c_str(),
             servo_num_total_);
 
-    // Leaders float on model gravity torque (i2rt behavior): without this the
+    // Leaders float on model gravity torque by design: without this the
     // gravity-compensation mode applies zero torque and the arm hangs limp,
     // drooping the moment the operator lets go. Arms whose algo lacks a
     // gravity model (base Algo no-op) still get zero torques.
@@ -1450,7 +1450,7 @@ ReturnCode DeviceArm::operate_as_follower() {
         }
 
         // Empirical per-joint fit on top of the model torques (matches the factors
-        // i2rt shipped for the same hardware). Defaults to 1.0 when unconfigured.
+        // configured for the same hardware). Defaults to 1.0 when unconfigured.
         i = 0;
         for (auto& p_joint : joints_) {
             target_tor_[i] *= p_joint->gravity_comp_factor_;

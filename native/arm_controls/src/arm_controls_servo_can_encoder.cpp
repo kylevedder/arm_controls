@@ -14,16 +14,16 @@
 // Trigger displacement per encoder tick.
 static constexpr float PASSIVE_ENCODER_RAD_PER_TICK = 2.0f * (float)M_PI / PASSIVE_ENCODER_TICKS_PER_REV;
 
-// Poll request payload (i2rt PassiveEncoderReader request frame).
+// Poll request payload captured from the teaching-handle protocol.
 #define PASSIVE_ENCODER_POLL_BYTE_0 0xFF
 #define PASSIVE_ENCODER_POLL_BYTE_1 0x02
 
-// i2rt encoder_manager REQ_RESTART: [ALL_DEVICE, 0x0F] reboots the handle
+// REQ_RESTART: [ALL_DEVICE, 0x0F] reboots the handle
 // firmware. Measured on yambot hardware: the encoder answers polls again
 // ~8.4 s after the restart request.
 #define PASSIVE_ENCODER_RESTART_BYTE_1 0x0F
 
-// i2rt's reader runs at 250 Hz. A poll remains outstanding for 10 ms; after
+// The reference reader runs at 250 Hz. A poll remains outstanding for 10 ms; after
 // that deadline the reader backs off for 500 ms before trying again. This
 // makes repeated read_hardware_values() calls idempotent even though generic
 // effector observation currently reads the joint twice per control loop.
@@ -74,7 +74,7 @@ ReturnCode ServoCanPassiveEncoder::init_config_model(const json& servo_config, c
         return ReturnCode::NOT_INITIALIZED;
     }
 
-    // Firmware receive mode: the i2rt default ("plus_one") answers on id + 1.
+    // Firmware receive mode: the default ("plus_one") answers on id + 1.
     // An explicit response_can_id in the model config overrides it.
     response_can_id_ = id_ + 1;
     if (servo_config.contains(p_config->fn_servo_response_can_id)) {
@@ -225,7 +225,7 @@ ReturnCode ServoCanPassiveEncoder::read_hardware_values() {
         return ReturnCode::FAIL;
     }
 
-    // i2rt convention: the trigger reading is the displacement MAGNITUDE
+    // Trigger convention: the reading is the displacement MAGNITUDE
     // (|ticks|), so handles whose encoder counts negative when squeezed map
     // onto the same [0, pos_max] joint range without per-side sign calibration.
     curr_pos_abs_ = fabsf(pos);
@@ -314,7 +314,7 @@ ReturnCode ServoCanPassiveEncoder::parse_encoder_status(const DriverCan::can_fra
     // Big-endian payload: device_id (u8), position (i16, ticks),
     // velocity (i16, ticks/s), digital_inputs (u8). The device_id byte is NOT
     // validated: YAM handle firmware reports 0 there regardless of the CAN id
-    // (observed on hardware; the i2rt reference ignores the byte as well), so
+    // (observed on hardware; the byte is not stable), so
     // routing trusts the registered response CAN id alone.
     const uint8_t* p_data = frame.data;
     const int16_t position_ticks = static_cast<int16_t>((p_data[1] << 8) | p_data[2]);

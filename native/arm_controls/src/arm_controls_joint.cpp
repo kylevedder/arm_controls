@@ -124,7 +124,7 @@ ReturnCode Joint::init_config_model(const json& joint_config, const DeviceConfig
     }
 
     // Load gravity feedforward scale (optional: empirical fit on top of the model
-    // torques; i2rt shipped the YAM with per-joint factors and these mirror that)
+    // torques; the YAM configuration uses per-joint factors and these mirror that)
     return_code = p_config->get_field_value(joint_config, p_config->fn_joint_gravity_comp_factor, gravity_comp_factor_);
     if (return_code == ReturnCode::SUCCESS) {
         ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: gravity_comp_factor=%.3f", id_, gravity_comp_factor_);

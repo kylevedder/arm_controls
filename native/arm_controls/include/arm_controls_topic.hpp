@@ -60,13 +60,13 @@
 #define DEVICE_INFO_COMMAND_ACK        31
 #define DEVICE_INFO_RUNTIME_MODE       32
 
-#define ARM_CONTROLS_CONTROL_PROTOCOL_VERSION_MAJOR 1
-#define ARM_CONTROLS_CONTROL_PROTOCOL_VERSION_MINOR 1
-#define ARM_CONTROLS_CONTROL_CAP_DIRECT_COMMAND      (1 << 0)
-#define ARM_CONTROLS_CONTROL_CAP_LIVE_INPUT          (1 << 1)
-#define ARM_CONTROLS_CONTROL_CAP_GRAVITY_COMP        (1 << 2)
-#define ARM_CONTROLS_CONTROL_CAP_FORCE_FEEDBACK      (1 << 3)
-#define ARM_CONTROLS_CONTROL_CAP_MOVE_TO_READY       (1 << 4)
+#define ARM_CONTROLS_PROTOCOL_VERSION_MAJOR 1
+#define ARM_CONTROLS_PROTOCOL_VERSION_MINOR 1
+#define ARM_CONTROLS_CAP_DIRECT_COMMAND      (1 << 0)
+#define ARM_CONTROLS_CAP_LIVE_INPUT          (1 << 1)
+#define ARM_CONTROLS_CAP_GRAVITY_COMP        (1 << 2)
+#define ARM_CONTROLS_CAP_FORCE_FEEDBACK      (1 << 3)
+#define ARM_CONTROLS_CAP_MOVE_TO_READY       (1 << 4)
 
 // Source enum for DEVICE_INFO_READY_MOVE_IN_PROGRESS param_int[0]. Concrete devices pass
 // these via Device::publish_ready_move_progress() so Python can distinguish startup vs

@@ -340,7 +340,7 @@ class NativeArmBackend(ArmBackend):
         if self._paired_follower_state_topic:
             args.extend(["--paired_follower_state_topic", self._paired_follower_state_topic])
         if role is ArmRole.FOLLOWER and config.follower_gravity_compensation:
-            # Arm-device-scoped MonoPi-style synchronized slew tracking plus
+            # Arm-device-scoped synchronized slew tracking plus
             # gravity/damping feedforward. The attached effector keeps the
             # planner from its own model config.
             args.extend(["--arm_planning_type", "slew_pos_gravity"])

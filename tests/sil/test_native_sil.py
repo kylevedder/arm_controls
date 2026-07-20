@@ -59,8 +59,8 @@ def fake_bus_with_gripper():
 def fake_bus_with_handle():
     from fake_dm_servo import FakeDmServoBus
 
-    # 0x50E is the fixed encoder id YAM teaching handles ship with (i2rt
-    # encoder_manager: REQ=0x50E, REPORT=0x50F).
+    # 0x50E is the fixed encoder id YAM teaching handles ship with
+    # (request=0x50E, report=0x50F).
     bus = FakeDmServoBus(VCAN, motor_ids=(1, 2, 3, 4, 5, 6), handle_encoder_id=0x50E)
     bus.start()
     yield bus
@@ -231,7 +231,7 @@ def test_connect_is_passive_and_explicit_homing_still_works(fake_bus, session_fa
 
 def test_gripper_polarity_and_command_round_trip(fake_bus_with_gripper):
     # Pins the E_Yam gripper's normalized convention end to end: 0 = closed (zero
-    # travel), 1 = open (full travel) -- the on-disk i2rt convention. The servo is
+    # travel), 1 = open (full travel) -- the on-disk model convention. The servo is
     # configured with dir_invert=-1, a joint-frame sign (relative = -absolute), which
     # must NOT flip the published value: treating it as "open at min" published the
     # physical YAM gripper inverted (physically closed read 1.0 -- caught on camera
@@ -552,7 +552,7 @@ def test_follower_gravity_compensation_feeds_torque(fake_bus):
     # With follower_gravity_compensation enabled, the arm device switches to
     # slew_pos_gravity planning: every follower position command carries a
     # model-based (pinocchio RNEA over Yam.urdf) gravity feedforward torque plus
-    # MonoPi-style viscous damping on joints 1-3. Park the fake arm bent so the
+    # configured viscous damping on joints 1-3. Park the fake arm bent so the
     # pitch joints are gravity-loaded, then assert the MIT command frames carry
     # torque on the loaded elbow and that position tracking still works through
     # the synchronized velocity slew limiter.
@@ -748,7 +748,7 @@ def test_leader_handle_trigger_and_buttons(fake_bus_with_handle):
     # First native leader-session coverage: the YAM teaching handle is a passive
     # CAN encoder (servo model "CAN Passive Encoder") that the node polls with
     # [0xFF, 0x02] and that answers on id+1 with trigger ticks + button bits.
-    # Pins the i2rt trigger convention end to end: released = effector 1.0
+    # Pins the trigger convention end to end: released = effector 1.0
     # (open), a full squeeze beyond the 0.63 rad calibration = 0.0, and the two buttons
     # surface through read_inputs() as ("top", "bottom").
     from arm_controls import ArmConfig, ArmSession, SocketCanConnection
@@ -774,7 +774,7 @@ def test_leader_handle_trigger_and_buttons(fake_bus_with_handle):
 
         # Physical full squeeze (~0.66 rad, beyond the calibrated 0.63 travel)
         # must saturate at 0.0 (closed) -- the instance config's pos_max is the
-        # i2rt trigger_closed_position calibration.
+        # trigger-closed position calibration.
         bus.set_trigger_rad(0.66)
         wait_for(
             lambda: leader.read_state(timeout_s=2.0).effector.position < 0.02,
@@ -870,7 +870,7 @@ def test_handle_encoder_transient_mute_holds_trigger(fake_bus_with_handle):
 
 
 def test_handle_encoder_wedge_recovers_via_firmware_restart(fake_bus_with_handle):
-    # A wedged handle that stays silent past ~3 s gets the i2rt REQ_RESTART
+    # A wedged handle that stays silent past ~3 s gets the REQ_RESTART
     # frame from the node; the real handle reboots and answers again ~8.5 s
     # later. The whole episode must ride through without emergency recovery
     # and without any test-side intervention.
@@ -914,7 +914,7 @@ def test_handle_encoder_wedge_recovers_via_firmware_restart(fake_bus_with_handle
 
 
 def test_leader_float_applies_gravity_torque(fake_bus_with_handle):
-    # A connected leader floats on model gravity torque (i2rt behavior): the
+    # A connected leader floats on model gravity torque by design: the
     # session puts leaders into gravity-compensation mode at connect, and the
     # node must feed pinocchio gravity torques to the loaded joints. Before the
     # fix, enabled_gravity_compensation_ was never set and "float" sent zero

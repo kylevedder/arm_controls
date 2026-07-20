@@ -6,8 +6,7 @@
  * (shared with the arm's DM servos). It is read-only: the driver polls it with
  * a 2-byte frame and the encoder answers with trigger position/velocity and
  * two button bits. It must never receive MIT command, enable, or zero frames.
- * Protocol captured from the i2rt reference implementation
- * (``PassiveEncoderReader`` in ``i2rt/motor_drivers/dm_driver.py``); see
+ * Protocol captured from the reference ``PassiveEncoderReader`` implementation; see
  * docs/yam_teaching_handle.md.
  */
 
@@ -115,7 +114,7 @@ class ServoCanPassiveEncoder : public Servo {
     ReturnCode send_poll_frame();
 
     /*!
-     * @brief Sends the i2rt REQ_RESTART frame ([0xFF, 0x0F]): reboots a wedged
+     * @brief Sends the REQ_RESTART frame ([0xFF, 0x0F]): reboots a wedged
      *        handle MCU. The encoder answers polls again ~8.5 s later.
      */
     ReturnCode send_restart_frame();

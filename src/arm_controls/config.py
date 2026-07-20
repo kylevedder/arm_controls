@@ -64,7 +64,7 @@ class InputLayout:
 # Name order follows the native MsgJoystick channel/button layout per handle
 # (see native/arm_controls/include/arm_controls_topic.hpp).
 _HANDLE_INPUT_LAYOUTS = {
-    # I2RT YAM teaching handle: two buttons, no joystick.
+    # YAM teaching handle: two buttons, no joystick.
     "E_Yam_Handle": InputLayout(button_names=("top", "bottom")),
 }
 

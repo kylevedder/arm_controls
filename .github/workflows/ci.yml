@@ -228,10 +228,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve apt cache key
+        id: apt-cache-key
+        run: echo "image=${ImageVersion:-unknown}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: .apt-cache
+          key: apt-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-cache-key.outputs.image }}-${{ hashFiles('scripts/install_build_deps_ubuntu.sh') }}
+
       - name: Install host build dependencies
+        env:
+          ARM_CONTROLS_APT_CACHE_DIR: ${{ github.workspace }}/.apt-cache
         run: |
-          sudo ./scripts/install_build_deps_ubuntu.sh
-          sudo apt-get install --no-install-recommends --yes ccache clang ninja-build
+          sudo --preserve-env=ARM_CONTROLS_APT_CACHE_DIR \
+            ./scripts/install_build_deps_ubuntu.sh clang
 
       - name: Cache native dependencies
         uses: actions/cache@v4
@@ -298,13 +310,15 @@ jobs:
 
       - name: Resolve apt cache key
         id: apt-cache-key
-        run: echo "kernel=$(uname -r)" >> "${GITHUB_OUTPUT}"
+        run: |
+          echo "image=${ImageVersion:-unknown}" >> "${GITHUB_OUTPUT}"
+          echo "kernel=$(uname -r)" >> "${GITHUB_OUTPUT}"
 
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: .apt-cache
-          key: apt-sil-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-cache-key.outputs.kernel }}-${{ hashFiles('scripts/install_build_deps_ubuntu.sh') }}
+          key: apt-sil-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-cache-key.outputs.image }}-${{ steps.apt-cache-key.outputs.kernel }}-${{ hashFiles('scripts/install_build_deps_ubuntu.sh') }}
 
       - name: Install host build dependencies
         env:

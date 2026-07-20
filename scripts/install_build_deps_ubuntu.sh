@@ -45,4 +45,10 @@ apt-get "${apt_options[@]}" install --no-install-recommends --yes \
   pkg-config \
   "${extra_packages[@]}"
 
+if [[ -n "${ARM_CONTROLS_APT_CACHE_DIR:-}" ]]; then
+  # apt creates root-owned lock/partial entries even inside the workspace.
+  # The cache action runs as the runner user and must be able to archive them.
+  chmod -R a+rwX "${ARM_CONTROLS_APT_CACHE_DIR}"
+fi
+
 echo "Installed arm_controls source-build dependencies for Ubuntu."

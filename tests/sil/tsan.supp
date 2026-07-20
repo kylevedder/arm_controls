@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions for the SIL run of arm_controls_node.
+#
+# libzmq is not built with TSan instrumentation; its internal lock-free
+# queues produce reports TSan cannot reason about. Races in arm_controls
+# code are NOT suppressed.
+called_from_lib:libzmq.so
+race:zmq::

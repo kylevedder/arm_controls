@@ -90,6 +90,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-index", required=True, type=int)
     parser.add_argument("--shard-count", required=True, type=int)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--durations-file", type=Path)
     parser.add_argument("--junit-xml", type=Path)
     parser.add_argument("paths", nargs="+")
@@ -99,6 +100,8 @@ def main() -> int:
         parser.error("--shard-count must be positive")
     if not 0 <= args.shard_index < args.shard_count:
         parser.error("--shard-index must be between zero and shard-count minus one")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
 
     collect = subprocess.run(
         [sys.executable, "-m", "pytest", "-o", "addopts=", "--collect-only", "-q", *args.paths],
@@ -117,7 +120,10 @@ def main() -> int:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     shards, totals = assign_shards(node_ids, args.shard_count, durations)
-    selected = shards[args.shard_index]
+    selected = sorted(
+        shards[args.shard_index],
+        key=lambda node_id: -durations.get(node_id, 0.0),
+    )
     if not selected:
         print("pytest shard selected no tests", file=sys.stderr)
         return 1
@@ -141,6 +147,8 @@ def main() -> int:
         "--durations=0",
         "--durations-min=0",
     ]
+    if args.workers > 1:
+        pytest_command.extend(["-n", str(args.workers), "--dist", "load"])
     if args.junit_xml is not None:
         pytest_command.extend(["--junitxml", str(args.junit_xml)])
     pytest_command.extend(selected)

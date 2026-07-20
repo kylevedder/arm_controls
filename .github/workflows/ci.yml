@@ -282,9 +282,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
     strategy:
       fail-fast: false
-      max-parallel: 12
+      max-parallel: 6
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -354,20 +354,20 @@ jobs:
       - name: Configure virtual CAN interfaces
         run: |
           sudo modprobe vcan
-          sudo ip link add dev vcan0 type vcan
-          sudo ip link set up vcan0
-          sudo ip link add dev vcan1 type vcan
-          sudo ip link set up vcan1
+          for interface in vcan0 vcan1 vcan2 vcan3; do
+            sudo ip link add dev "${interface}" type vcan
+            sudo ip link set up "${interface}"
+          done
 
       - name: Run SIL tests
         env:
           ARM_CONTROLS_NODE: ${{ github.workspace }}/build-sil/native/arm_controls/arm_controls_node
-          ARM_CONTROLS_SIL_VCAN: vcan0
-          ARM_CONTROLS_SIL_VCAN2: vcan1
+          ARM_CONTROLS_SIL_VCAN_PAIRS: "vcan0,vcan1;vcan2,vcan3"
         run: |
           uv run --no-sync python scripts/run_pytest_shard.py \
             --shard-index "${{ matrix.shard }}" \
-            --shard-count 12 \
+            --shard-count 6 \
+            --workers 2 \
             --durations-file tests/sil/durations.json \
             --junit-xml "sil-shard-${{ matrix.shard }}.xml" \
             tests/sil

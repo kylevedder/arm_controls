@@ -18,10 +18,31 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-VCAN = os.environ.get("ARM_CONTROLS_SIL_VCAN", "")
-# Second bus for leader/follower pair tests (the leader and follower are
-# separate physical CAN buses on the real cell).
-VCAN2 = os.environ.get("ARM_CONTROLS_SIL_VCAN2", "")
+def _worker_vcan_pair() -> tuple[str, str]:
+    pairs_value = os.environ.get("ARM_CONTROLS_SIL_VCAN_PAIRS", "")
+    if not pairs_value:
+        return (
+            os.environ.get("ARM_CONTROLS_SIL_VCAN", ""),
+            os.environ.get("ARM_CONTROLS_SIL_VCAN2", ""),
+        )
+
+    pairs = [tuple(value.split(",", 1)) for value in pairs_value.split(";")]
+    if any(len(pair) != 2 or not all(pair) for pair in pairs):
+        raise RuntimeError("ARM_CONTROLS_SIL_VCAN_PAIRS must contain primary,secondary pairs")
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    if not worker_id.startswith("gw") or not worker_id[2:].isdigit():
+        raise RuntimeError(f"unsupported pytest-xdist worker id {worker_id!r}")
+    worker_index = int(worker_id[2:])
+    if worker_index >= len(pairs):
+        raise RuntimeError(
+            f"pytest-xdist worker {worker_id} has no ARM_CONTROLS_SIL_VCAN_PAIRS entry"
+        )
+    return pairs[worker_index]
+
+
+VCAN, VCAN2 = _worker_vcan_pair()
+# The second bus is used for leader/follower pair tests (the leader and
+# follower are separate physical CAN buses on the real cell).
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux" or not VCAN or not (Path("/sys/class/net") / VCAN).exists(),

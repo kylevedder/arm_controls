@@ -20,16 +20,17 @@ extra_packages=("$@")
 apt_options=()
 if [[ -n "${ARM_CONTROLS_APT_CACHE_DIR:-}" ]]; then
   apt_archives_dir="${ARM_CONTROLS_APT_CACHE_DIR}/archives"
-  apt_lists_dir="${ARM_CONTROLS_APT_CACHE_DIR}/lists"
-  apt_update_stamp="${ARM_CONTROLS_APT_CACHE_DIR}/update-complete"
-  install -d -m 0777 \
-    "${apt_archives_dir}" "${apt_archives_dir}/partial" \
-    "${apt_lists_dir}" "${apt_lists_dir}/partial"
+  install -d -m 0777 "${apt_archives_dir}" "${apt_archives_dir}/partial"
   apt_options=(
     -o "Dir::Cache::archives=${apt_archives_dir}"
-    -o "Dir::State::lists=${apt_lists_dir}"
     -o "APT::Keep-Downloaded-Packages=true"
   )
+  if [[ "${ARM_CONTROLS_APT_CACHE_LISTS:-0}" == "1" ]]; then
+    apt_lists_dir="${ARM_CONTROLS_APT_CACHE_DIR}/lists"
+    apt_update_stamp="${ARM_CONTROLS_APT_CACHE_DIR}/update-complete"
+    install -d -m 0777 "${apt_lists_dir}" "${apt_lists_dir}/partial"
+    apt_options+=(-o "Dir::State::lists=${apt_lists_dir}")
+  fi
 fi
 
 if [[ -z "${apt_update_stamp:-}" || ! -f "${apt_update_stamp}" ]]; then

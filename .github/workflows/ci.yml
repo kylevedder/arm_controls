@@ -20,7 +20,7 @@ env:
 
 jobs:
   python:
-    name: Python API tests
+    name: Python API tests and targeted valgrind
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -35,10 +35,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Install Python build helpers
+      - name: Install Python and valgrind build helpers
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes cmake ninja-build
+          sudo apt-get install --no-install-recommends --yes \
+            cmake g++ git libboost-dev ninja-build valgrind
 
       - name: Install package with native runtime disabled
         run: |
@@ -51,6 +52,24 @@ jobs:
 
       - name: Pytest
         run: uv run --no-sync pytest -q tests --ignore=tests/sil
+
+      - name: Configure targeted valgrind tests
+        run: |
+          cmake -S . -B build-valgrind -G Ninja \
+            -DARM_CONTROLS_BUILD_NATIVE=OFF \
+            -DARM_CONTROLS_BUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build targeted valgrind tests
+        run: cmake --build build-valgrind --target arm_controls_tests --parallel "${BUILD_JOBS}"
+
+      - name: Run targeted tests under valgrind
+        run: |
+          valgrind --leak-check=full --show-leak-kinds=definite,indirect \
+            --errors-for-leak-kinds=definite,indirect --track-origins=yes \
+            --error-exitcode=1 \
+            ./build-valgrind/native/arm_controls/tests/arm_controls_tests \
+            --gtest_filter='MathOps.*:Filter*.*:StallDetect.*:HoldChecker.*:CurrentEstimation.*:DeviceConfigTest.*:DriverCanTransport.*:DmServoStatus.*'
 
   native:
     name: Native C++ tests
@@ -122,8 +141,7 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { name: asan, sanitizer: address, test_regex_env: ASAN_TEST_REGEX }
-          - { name: ubsan, sanitizer: undefined, test_regex_env: ASAN_TEST_REGEX }
+          - { name: asan-ubsan, sanitizer: "address,undefined", test_regex_env: ASAN_TEST_REGEX }
           - { name: tsan, sanitizer: thread, test_regex_env: TSAN_TEST_REGEX }
     steps:
       - uses: actions/checkout@v4
@@ -181,36 +199,6 @@ jobs:
           test_regex="${!TEST_REGEX_ENV}"
           ctest --test-dir "build-${{ matrix.config.name }}" --output-on-failure -R "${test_regex}"
 
-  native-valgrind:
-    name: Native targeted valgrind
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install host build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes cmake g++ git libboost-dev ninja-build valgrind
-
-      - name: Configure
-        run: |
-          cmake -S . -B build-valgrind -G Ninja \
-            -DARM_CONTROLS_BUILD_NATIVE=OFF \
-            -DARM_CONTROLS_BUILD_TESTING=ON \
-            -DCMAKE_BUILD_TYPE=Debug
-
-      - name: Build
-        run: cmake --build build-valgrind --target arm_controls_tests --parallel "${BUILD_JOBS}"
-
-      - name: Run targeted tests under valgrind
-        run: |
-          valgrind --leak-check=full --show-leak-kinds=definite,indirect \
-            --errors-for-leak-kinds=definite,indirect --track-origins=yes \
-            --error-exitcode=1 \
-            ./build-valgrind/native/arm_controls/tests/arm_controls_tests \
-            --gtest_filter='MathOps.*:Filter*.*:StallDetect.*:HoldChecker.*:CurrentEstimation.*:DeviceConfigTest.*:DriverCanTransport.*:DmServoStatus.*'
-
   fuzz:
     name: Fuzz CAN/DM status parsers (seed ${{ matrix.seed }})
     runs-on: ubuntu-22.04
@@ -241,8 +229,9 @@ jobs:
       - name: Install host build dependencies
         env:
           ARM_CONTROLS_APT_CACHE_DIR: ${{ github.workspace }}/.apt-cache
+          ARM_CONTROLS_APT_CACHE_LISTS: "1"
         run: |
-          sudo --preserve-env=ARM_CONTROLS_APT_CACHE_DIR \
+          sudo --preserve-env=ARM_CONTROLS_APT_CACHE_DIR,ARM_CONTROLS_APT_CACHE_LISTS \
             ./scripts/install_build_deps_ubuntu.sh clang
 
       - name: Cache native dependencies
@@ -293,9 +282,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 12
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
 
@@ -378,7 +367,7 @@ jobs:
         run: |
           uv run --no-sync python scripts/run_pytest_shard.py \
             --shard-index "${{ matrix.shard }}" \
-            --shard-count 10 \
+            --shard-count 12 \
             --durations-file tests/sil/durations.json \
             --junit-xml "sil-shard-${{ matrix.shard }}.xml" \
             tests/sil

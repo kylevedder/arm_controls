@@ -212,7 +212,7 @@ jobs:
             --gtest_filter='MathOps.*:Filter*.*:StallDetect.*:HoldChecker.*:CurrentEstimation.*:DeviceConfigTest.*:DriverCanTransport.*:DmServoStatus.*'
 
   fuzz:
-    name: Fuzz CAN/DM status parsers
+    name: Fuzz CAN/DM status parsers (seed ${{ matrix.seed }})
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
@@ -220,6 +220,11 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        seed: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
@@ -262,7 +267,8 @@ jobs:
       - name: Fuzz parser harness
         run: |
           ./build-fuzz/native/arm_controls/fuzz_servo_status_parsers \
-            -max_total_time=120 -close_fd_mask=3 -print_final_stats=1
+            -max_total_time=40 -seed=${{ matrix.seed }} \
+            -close_fd_mask=3 -print_final_stats=1
 
   sil:
     name: SIL on vcan (shard ${{ matrix.shard }})
@@ -275,9 +281,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
     strategy:
       fail-fast: false
-      max-parallel: 12
+      max-parallel: 10
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v4
 
@@ -290,9 +296,22 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - name: Resolve apt cache key
+        id: apt-cache-key
+        run: echo "kernel=$(uname -r)" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: .apt-cache
+          key: apt-sil-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-cache-key.outputs.kernel }}-${{ hashFiles('scripts/install_build_deps_ubuntu.sh') }}
+
       - name: Install host build dependencies
+        env:
+          ARM_CONTROLS_APT_CACHE_DIR: ${{ github.workspace }}/.apt-cache
         run: |
-          sudo ./scripts/install_build_deps_ubuntu.sh "linux-modules-extra-$(uname -r)"
+          sudo --preserve-env=ARM_CONTROLS_APT_CACHE_DIR \
+            ./scripts/install_build_deps_ubuntu.sh "linux-modules-extra-$(uname -r)"
 
       - name: Cache native dependencies
         uses: actions/cache@v4
@@ -345,7 +364,7 @@ jobs:
         run: |
           uv run --no-sync python scripts/run_pytest_shard.py \
             --shard-index "${{ matrix.shard }}" \
-            --shard-count 12 \
+            --shard-count 10 \
             --durations-file tests/sil/durations.json \
             --junit-xml "sil-shard-${{ matrix.shard }}.xml" \
             tests/sil

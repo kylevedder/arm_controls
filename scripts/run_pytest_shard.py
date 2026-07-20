@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import statistics
 import subprocess
 import sys
@@ -40,11 +41,13 @@ def load_durations(path: Path | None) -> dict[str, float]:
 def assign_shards(
     node_ids: list[str], shard_count: int, durations: dict[str, float]
 ) -> tuple[list[list[str]], list[float]]:
-    """Balance tests with longest-processing-time-first scheduling.
+    """Balance tests with deterministic multi-start greedy scheduling.
 
     Unknown tests use the median measured duration. With no measurements every
     test has equal weight, which degenerates to deterministic round-robin
-    assignment while the first instrumented run gathers real timings.
+    assignment while the first instrumented run gathers real timings. Once
+    measurements exist, randomized candidates escape common LPT bin-packing
+    traps; the fixed seed keeps assignments reproducible.
     """
     measured = [durations[node_id] for node_id in node_ids if node_id in durations]
     default_duration = statistics.median(measured) if measured else 1.0
@@ -53,16 +56,34 @@ def assign_shards(
         key=lambda item: (-durations.get(item[1], default_duration), item[0])
     )
 
-    shards: list[list[str]] = [[] for _ in range(shard_count)]
-    totals = [0.0] * shard_count
-    for _collection_index, node_id in indexed_node_ids:
-        shard_index = min(
-            range(shard_count),
-            key=lambda index: (totals[index], len(shards[index]), index),
-        )
-        shards[shard_index].append(node_id)
-        totals[shard_index] += durations.get(node_id, default_duration)
-    return shards, totals
+    def greedy_assign(order: list[tuple[int, str]]) -> tuple[list[list[str]], list[float]]:
+        shards: list[list[str]] = [[] for _ in range(shard_count)]
+        totals = [0.0] * shard_count
+        for _collection_index, node_id in order:
+            shard_index = min(
+                range(shard_count),
+                key=lambda index: (totals[index], len(shards[index]), index),
+            )
+            shards[shard_index].append(node_id)
+            totals[shard_index] += durations.get(node_id, default_duration)
+        return shards, totals
+
+    best_shards, best_totals = greedy_assign(indexed_node_ids)
+    best_score = (max(best_totals, default=0.0), sum(total**2 for total in best_totals))
+    if measured:
+        randomizer = random.Random(0xA2C)
+        for _trial in range(2048):
+            candidate_order = indexed_node_ids.copy()
+            randomizer.shuffle(candidate_order)
+            candidate_shards, candidate_totals = greedy_assign(candidate_order)
+            candidate_score = (
+                max(candidate_totals, default=0.0),
+                sum(total**2 for total in candidate_totals),
+            )
+            if candidate_score < best_score:
+                best_shards, best_totals = candidate_shards, candidate_totals
+                best_score = candidate_score
+    return best_shards, best_totals
 
 
 def main() -> int:

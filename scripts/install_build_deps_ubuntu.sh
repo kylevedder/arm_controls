@@ -17,9 +17,17 @@ export DEBIAN_FRONTEND=noninteractive
 # Optional arguments are additional apt packages needed by a particular build
 # lane (for example the exact runner kernel's virtual-CAN module package).
 extra_packages=("$@")
+apt_options=()
+if [[ -n "${ARM_CONTROLS_APT_CACHE_DIR:-}" ]]; then
+  install -d -m 0777 "${ARM_CONTROLS_APT_CACHE_DIR}" "${ARM_CONTROLS_APT_CACHE_DIR}/partial"
+  apt_options=(
+    -o "Dir::Cache::archives=${ARM_CONTROLS_APT_CACHE_DIR}"
+    -o "APT::Keep-Downloaded-Packages=true"
+  )
+fi
 
-apt-get update
-apt-get install --no-install-recommends --yes \
+apt-get "${apt_options[@]}" update
+apt-get "${apt_options[@]}" install --no-install-recommends --yes \
   build-essential \
   ca-certificates \
   cmake \

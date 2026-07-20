@@ -15,7 +15,7 @@ defaults:
 
 env:
   PYTHON_VERSION: "3.11"
-  BUILD_JOBS: "2"
+  BUILD_JOBS: "4"
   UV_LINK_MODE: copy
 
 jobs:
@@ -265,14 +265,19 @@ jobs:
             -max_total_time=120 -close_fd_mask=3 -print_final_stats=1
 
   sil:
-    name: SIL on vcan
+    name: SIL on vcan (shard ${{ matrix.shard }})
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
 
@@ -287,8 +292,7 @@ jobs:
 
       - name: Install host build dependencies
         run: |
-          sudo ./scripts/install_build_deps_ubuntu.sh
-          sudo apt-get install --no-install-recommends --yes ccache ninja-build
+          sudo ./scripts/install_build_deps_ubuntu.sh "linux-modules-extra-$(uname -r)"
 
       - name: Cache native dependencies
         uses: actions/cache@v4
@@ -327,11 +331,7 @@ jobs:
 
       - name: Configure virtual CAN interfaces
         run: |
-          sudo modprobe vcan || {
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends --yes "linux-modules-extra-$(uname -r)"
-            sudo modprobe vcan
-          }
+          sudo modprobe vcan
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
           sudo ip link add dev vcan1 type vcan
@@ -342,4 +342,19 @@ jobs:
           ARM_CONTROLS_NODE: ${{ github.workspace }}/build-sil/native/arm_controls/arm_controls_node
           ARM_CONTROLS_SIL_VCAN: vcan0
           ARM_CONTROLS_SIL_VCAN2: vcan1
-        run: uv run --no-sync pytest -q tests/sil
+        run: |
+          uv run --no-sync python scripts/run_pytest_shard.py \
+            --shard-index "${{ matrix.shard }}" \
+            --shard-count 12 \
+            --durations-file tests/sil/durations.json \
+            --junit-xml "sil-shard-${{ matrix.shard }}.xml" \
+            tests/sil
+
+      - name: Upload SIL timing report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sil-timing-${{ matrix.shard }}
+          path: sil-shard-${{ matrix.shard }}.xml
+          if-no-files-found: warn
+          retention-days: 14

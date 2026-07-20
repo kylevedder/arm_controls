@@ -14,6 +14,10 @@ fi
 # shellcheck disable=SC1091
 export DEBIAN_FRONTEND=noninteractive
 
+# Optional arguments are additional apt packages needed by a particular build
+# lane (for example the exact runner kernel's virtual-CAN module package).
+extra_packages=("$@")
+
 apt-get update
 apt-get install --no-install-recommends --yes \
   build-essential \
@@ -30,6 +34,7 @@ apt-get install --no-install-recommends --yes \
   liburdfdom-headers-dev \
   libzmq3-dev \
   ninja-build \
-  pkg-config
+  pkg-config \
+  "${extra_packages[@]}"
 
 echo "Installed arm_controls source-build dependencies for Ubuntu."

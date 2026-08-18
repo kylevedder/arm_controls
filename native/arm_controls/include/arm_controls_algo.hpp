@@ -20,8 +20,7 @@ class Joint;
  * @brief Enumeration for different trajectory planning strategies.
  */
 enum class TrajectoryPlanningType {
-    NONE,                     ///< No trajectory planning; target position is sent directly to the servo.
-    SLEW_POS_GRAVITY          ///< Velocity-limited follower tracking with gravity compensation.
+    NONE                      ///< No trajectory planning; target position is sent directly to the servo.
 };
 
 /*!
@@ -67,6 +66,16 @@ class Algo {
         (void)calculated_torques;
         return ReturnCode::SUCCESS;
     }
+
+    /*!
+     * @brief Whether gravity_compensation() computes real model torques.
+     *
+     * The base class is a no-op (zero torques), so callers that require actual
+     * compensation (follower gravity feed-forward) must check this and fail
+     * fast instead of silently commanding zero torque.
+     * @return True when a dynamics model (URDF) is loaded.
+     */
+    virtual bool has_gravity_model() const { return false; }
 
     /*!
      * @brief Initializes the algorithm with the given device configuration.
@@ -137,7 +146,8 @@ class Algo {
 
     int calc_done_t_ = 0;  ///< Timestamp indicating when the last calculation was completed. Used for performance monitoring.
 
-    int control_frequency_ = 50;  ///< The main control loop frequency in Hz. Reinitialized in init() with config parameter.
+    /// The main control loop frequency in Hz. Set in init() from the required CLI parameter.
+    int control_frequency_ = 0;
 
     Device* p_device_ = nullptr;  ///< Pointer to the Device instance that this algorithm controls. Set during construction.
 

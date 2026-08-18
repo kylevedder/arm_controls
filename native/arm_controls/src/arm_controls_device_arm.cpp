@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 #include <unordered_set>
 
 #include "arm_controls_device_arm.hpp"
@@ -45,7 +46,7 @@ ReturnCode DeviceArm::set_control_mode(Role target_role, ControlModeIntent inten
     //   safely from the current pose.
     // - NORMAL_OPERATION: follow target_role (leader vs follower).
     //
-    // The ARX device subclass may override hardware-specific behavior.
+    // The CAN device subclass may override hardware-specific behavior.
     const bool use_follower_like = (intent == ControlModeIntent::READY_MOVE_OVERRIDE) || (target_role == Role::FOLLOWER);
     ReturnCode rc = ReturnCode::SUCCESS;
 
@@ -75,9 +76,122 @@ ReturnCode DeviceArm::set_control_mode(Role target_role, ControlModeIntent inten
 
     if (use_follower_like) {
         reset_slew_targets_to_current();
+        // Any (re-)entry into position control ends a calibration gravity
+        // float: move-to-ready and emergency recovery must never fight the
+        // float branch of operate_as_follower().
+        gravity_float_active_ = false;
     }
 
     return ReturnCode::SUCCESS;
+}
+
+ReturnCode DeviceArm::set_runtime_gravity_float(bool enabled, float abort_drift_rad) {
+    if (role_ != Role::FOLLOWER) {
+        return ReturnCode::NOT_SUPPORTED;
+    }
+    if (enabled == gravity_float_active_) {
+        return ReturnCode::SUCCESS;
+    }
+    if (enabled) {
+        if (!p_algo_) {
+            ARM_CONTROLS_ERROR("%s_%s: gravity float needs a gravity-capable algo (URDF-backed); none is initialized",
+                     model_.c_str(), id_.c_str());
+            return ReturnCode::NOT_SUPPORTED;
+        }
+        if (!std::isfinite(abort_drift_rad) || abort_drift_rad <= 0.0f) {
+            ARM_CONTROLS_ERROR("%s_%s: gravity float abort threshold must be a positive radian value, got %.3f",
+                     model_.c_str(), id_.c_str(), abort_drift_rad);
+            return ReturnCode::INVALID_PARAM;
+        }
+        // The runaway baseline: the loop watches |pos - baseline| per joint and
+        // re-engages HOLD itself. The client is too slow for this judgment
+        // (ZMQ round trip), so the stop must live here.
+        gravity_float_baseline_.clear();
+        for (auto& p_joint : joints_) {
+            gravity_float_baseline_.push_back(p_joint->get_pos_rad_relative());
+        }
+        gravity_float_abort_rad_ = abort_drift_rad;
+        prof_time_t current_time = Profile::get_time_now();
+        for (auto& p_joint : joints_) {
+            ReturnCode return_code = p_joint->change_control_mode_for_leader(current_time);
+            if (return_code != ReturnCode::SUCCESS) return return_code;
+        }
+        gravity_float_active_ = true;
+        ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                "%s_%s: entering calibration gravity float (gravity feed-forward only; abort drift %.3f rad; "
+                "HOLD re-engages position control)",
+                model_.c_str(), id_.c_str(), abort_drift_rad);
+        return ReturnCode::SUCCESS;
+    }
+    for (auto& p_joint : joints_) {
+        ReturnCode return_code = p_joint->change_control_mode_for_follower();
+        if (return_code != ReturnCode::SUCCESS) return return_code;
+    }
+    reset_slew_targets_to_current();
+    gravity_float_active_ = false;
+    ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+            "%s_%s: leaving calibration gravity float (position control re-engaged at the current pose)",
+            model_.c_str(), id_.c_str());
+    return ReturnCode::SUCCESS;
+}
+
+ReturnCode DeviceArm::set_runtime_torq_rescale(const std::vector<float>& values) {
+    if ((int)values.size() != dof_) {
+        ARM_CONTROLS_ERROR("%s_%s: runtime torq_rescale update has %d values but the arm has %d joints", model_.c_str(),
+                 id_.c_str(), (int)values.size(), dof_);
+        return ReturnCode::INVALID_PARAM;
+    }
+    for (float value : values) {
+        if (!std::isfinite(value) || value < 0.0f) {
+            ARM_CONTROLS_ERROR("%s_%s: runtime torq_rescale values must be finite and nonnegative, got %.3f",
+                     model_.c_str(), id_.c_str(), value);
+            return ReturnCode::INVALID_PARAM;
+        }
+    }
+    std::ostringstream summary;
+    for (size_t i = 0; i < joints_.size(); i++) {
+        joints_[i]->torq_rescale_ = values[i];
+        summary << (i > 0 ? ", " : "") << values[i];
+    }
+    ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0, "%s_%s: torq_rescale updated at runtime: [%s]", model_.c_str(),
+            id_.c_str(), summary.str().c_str());
+    return ReturnCode::SUCCESS;
+}
+
+ReturnCode DeviceArm::publish_next_servo_param() {
+    if (joints_.empty()) {
+        return ReturnCode::SUCCESS;
+    }
+    const int index = servo_param_publish_index_ % (int)joints_.size();
+    servo_param_publish_index_ = (index + 1) % (int)joints_.size();
+    Servo::MitCodecReport report;
+    if (!joints_[index]->get_mit_codec_report(report)) {
+        return ReturnCode::SUCCESS;
+    }
+    // The gravity feed-forward flag is device-level; it rides every joint's
+    // report so one message is enough to know the applied state. The wire
+    // format caps a device-info message at 10 floats, so the position gains
+    // travel in the int slots as milli-units.
+    std::vector<int> ints = {index,
+                             report.reported_spd_valid ? 1 : 0,
+                             report.reported_tor_valid ? 1 : 0,
+                             follower_gravity_compensation_ ? 1 : 0,
+                             (int)std::lround(report.pos_kp * 1000.0f),
+                             (int)std::lround(report.pos_kd * 1000.0f)};
+    std::vector<float> floats = {report.codec_vel_min,    report.codec_vel_max,    report.codec_tor_min,
+                                 report.codec_tor_max,    report.reported_spd_min, report.reported_spd_max,
+                                 report.reported_tor_min, report.reported_tor_max, report.torq_rescale};
+    return publish_device_info(DEVICE_INFO_SERVO_PARAM, &floats, &ints);
+}
+
+ReturnCode DeviceArm::runtime_hold() {
+    if (gravity_float_active_) {
+        ReturnCode return_code = set_runtime_gravity_float(false, 0.0f);
+        if (return_code != ReturnCode::SUCCESS) {
+            return return_code;
+        }
+    }
+    return Device::runtime_hold();
 }
 
 ReturnCode DeviceArm::set_runtime_force_feedback(bool enabled, float gain) {
@@ -132,16 +246,47 @@ void DeviceArm::clear_command_buffers_for_move_to_ready() {
 }
 
 void DeviceArm::reset_slew_targets_to_current() {
-    if (planning_type_ != TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-        return;
-    }
-
+    // The synchronized follower slew integrates from prev_target_pos_ for every
+    // planning type, so the rebase must run unconditionally.
     for (auto& p_joint : joints_) {
         const float current = p_joint->get_pos_rad_relative();
         p_joint->target_pos_ = current;
         p_joint->adjusted_target_pos_ = current;
         p_joint->prev_target_pos_ = current;
     }
+    follower_slew_last_time_ = std::chrono::steady_clock::now();
+}
+
+ReturnCode DeviceArm::update_follower_feedforward_torques() {
+    std::fill(target_tor_.begin(), target_tor_.end(), 0.0f);
+
+    if (!follower_gravity_compensation_) {
+        return ReturnCode::SUCCESS;
+    }
+    if (!p_algo_) {
+        ARM_CONTROLS_ERROR("Algorithm handler is not initialized while computing follower feed-forward for %s_%s",
+                 model_.c_str(), id_.c_str());
+        return ReturnCode::NOT_INITIALIZED;
+    }
+
+    int i = 0;
+    for (auto& p_joint : joints_) {
+        current_motor_positions_[i++] = p_joint->get_pos_rad_relative() * p_joint->get_dir_invert();
+    }
+
+    ReturnCode return_code = p_algo_->gravity_compensation(current_motor_positions_, target_tor_);
+    if (return_code != ReturnCode::SUCCESS) {
+        ARM_CONTROLS_ERROR("Gravity compensation algorithm execution failed for %s_%s", model_.c_str(), id_.c_str());
+        return return_code;
+    }
+
+    i = 0;
+    for (auto& p_joint : joints_) {
+        target_tor_[i] *= p_joint->gravity_comp_factor_;
+        target_tor_[i] -= p_joint->follow_viscous_damping_ * p_joint->get_vel_rad_sec();
+        i++;
+    }
+    return ReturnCode::SUCCESS;
 }
 
 ReturnCode DeviceArm::park_safely() {
@@ -193,26 +338,47 @@ ReturnCode DeviceArm::read_hardware_values() {
         group_return_code = p_driver_->group_read_hardware_values();
         if (group_return_code != ReturnCode::SUCCESS) {
             // Pull the driver-level dead-set and mark every affected joint as failed.
-            const auto driver_dead = p_driver_->dead_servo_ids();
-            const int driver_failed_servo_id = p_driver_->last_failed_servo_id();
-            if (driver_failed_servo_id >= 0) {
-                set_last_failed_joint_id(driver_failed_servo_id);
-            }
-            if (tolerate_partial_failure) {
-                for (int sid : driver_dead) {
-                    mark_joint_failed_during_recovery(static_cast<int16_t>(sid));
+            auto driver_dead = p_driver_->dead_servo_ids();
+            // The driver scans every servo bound to this device, including the
+            // effector's (get_servo_ids() appends them). DeviceArm::start() only
+            // starts the effector AFTER the arm's first read, and DM servos never
+            // broadcast spontaneously -- so before the effector has been started,
+            // its servos cannot have produced a frame yet and always scan as
+            // "dead" here. That is a startup-ordering artifact, not a hardware
+            // failure: drop not-yet-started effector servos from this cycle's
+            // dead-set. Once the effector is ready its servos are scanned again.
+            if (p_effector_ != nullptr && p_effector_->is_ready() == false) {
+                std::vector<int> effector_servo_ids;
+                if (p_effector_->get_servo_ids(effector_servo_ids) == ReturnCode::SUCCESS) {
+                    for (int effector_sid : effector_servo_ids) {
+                        driver_dead.erase(effector_sid);
+                    }
                 }
             }
-            if (in_recovery) {
-                ARM_CONTROLS_WARN("Group read failed during recovery for %s_%s (dead_servo_ids=%zu, first=%d); continuing with cached data for responsive joints",
-                        model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
-            } else if (is_ready_ == false) {
-                is_normal_status_ = false;
-                ARM_CONTROLS_WARN("Group read failed during startup for %s_%s (dead_servo_ids=%zu, first=%d); marking dead servos failed and continuing",
-                        model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
+            if (driver_dead.empty()) {
+                group_return_code = ReturnCode::SUCCESS;
             } else {
-                ARM_CONTROLS_ERROR("Group read hardware values failed for %s_%s (dead_servo_ids=%zu, first=%d)",
-                         model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
+                // Lowest dead id is the most useful single id to surface (same
+                // rule as the driver: on a daisy-chained bus the lowest id is
+                // the disconnection point).
+                const int driver_failed_servo_id = *driver_dead.begin();
+                set_last_failed_joint_id(driver_failed_servo_id);
+                if (tolerate_partial_failure) {
+                    for (int sid : driver_dead) {
+                        mark_joint_failed_during_recovery(static_cast<int16_t>(sid));
+                    }
+                }
+                if (in_recovery) {
+                    ARM_CONTROLS_WARN("Group read failed during recovery for %s_%s (dead_servo_ids=%zu, first=%d); continuing with cached data for responsive joints",
+                            model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
+                } else if (is_ready_ == false) {
+                    is_normal_status_ = false;
+                    ARM_CONTROLS_WARN("Group read failed during startup for %s_%s (dead_servo_ids=%zu, first=%d); marking dead servos failed and continuing",
+                            model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
+                } else {
+                    ARM_CONTROLS_ERROR("Group read hardware values failed for %s_%s (dead_servo_ids=%zu, first=%d)",
+                             model_.c_str(), id_.c_str(), driver_dead.size(), driver_failed_servo_id);
+                }
             }
             return_code = ReturnCode::SUCCESS;
         }
@@ -448,6 +614,12 @@ float DeviceArm::get_ready_move_completion_ratio() const {
 ReturnCode DeviceArm::write_hardware_values() {
     ReturnCode return_code = ReturnCode::SUCCESS;
 
+    if (is_read_only() == true) {
+        // Read-only arm (e.g. ARX encoder leader): nothing is ever written to
+        // the bus, mirroring the read-only effector path.
+        return ReturnCode::SUCCESS;
+    }
+
     if (is_driver_created_by_this_) {
         if (p_driver_ == nullptr) {
             ARM_CONTROLS_ERROR("Driver handler is not initialized in write_hardware_values()");
@@ -512,6 +684,24 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
                 model_.c_str(), id_.c_str());
     }
 
+    // Follower gravity feed-forward: the individual config JSON declares the default and the
+    // --follower_gravity_compensation override (fed by devices.toml) takes precedence.
+    bool follower_gravity_requested;
+    return_code = p_config_individual_->get_field_value(p_config_individual_->values_,
+                                                        p_config_individual_->fn_follower_gravity_compensation,
+                                                        follower_gravity_requested);
+    if (return_code != ReturnCode::SUCCESS) {
+        ARM_CONTROLS_ERROR("%s_%s: follower_gravity_compensation is not defined in the individual configuration "
+                 "(required since config_version 1.3.0)",
+                 model_.c_str(), id_.c_str());
+        return return_code;
+    }
+    const char* follower_gravity_source = "individual config default";
+    if (cla_.follower_gravity_compensation_override != OPT_FOLLOWER_GRAVITY_COMPENSATION_DEFAULT) {
+        follower_gravity_requested = (cla_.follower_gravity_compensation_override == "true");
+        follower_gravity_source = "devices.toml override (beats the individual config)";
+    }
+
     return_code = enable_spring_effect(spring_effect);
     if (return_code != ReturnCode::SUCCESS) {
         ARM_CONTROLS_ERROR("Failed to enable spring effect for %s_%s", model_.c_str(), id_.c_str());
@@ -537,6 +727,37 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
 
     dof_ = (int)joints_.size();
     ARM_CONTROLS_INFO("DeviceArm", InfoLevel::HELPFUL_1, "DeviceArm %s_%s: DOF=%d", model_.c_str(), id_.c_str(), dof_);
+
+    // Highest-precedence torq_rescale override (devices.toml [arms] torq_rescale
+    // -> --torq_rescale): applied after the model and individual configs so a
+    // per-unit gravity-delivery calibration needs no JSON edit or wheel rebuild.
+    if (!cla_.torq_rescale_override.empty()) {
+        if ((int)cla_.torq_rescale_override.size() != dof_) {
+            ARM_CONTROLS_ERROR("%s_%s: --%s has %d values but the arm has %d joints", model_.c_str(), id_.c_str(),
+                     OPT_TORQ_RESCALE, (int)cla_.torq_rescale_override.size(), dof_);
+            return ReturnCode::INVALID_PARAM;
+        }
+        for (size_t i = 0; i < joints_.size(); i++) {
+            joints_[i]->torq_rescale_ = cla_.torq_rescale_override[i];
+        }
+        ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                "%s_%s: torq_rescale overridden by devices.toml [arms] torq_rescale (beats model and "
+                "individual configs)",
+                model_.c_str(), id_.c_str());
+    }
+
+    // One-line torque-delivery summary so an A/B run comparison can be
+    // reconstructed from the logs alone: effective wire torque per joint is
+    // torq_rescale x MIT codec full scale (the codec ranges are logged by each
+    // servo at connect), clipped to torq_max.
+    std::ostringstream rescale_summary;
+    std::ostringstream torq_max_summary;
+    for (size_t i = 0; i < joints_.size(); i++) {
+        rescale_summary << (i > 0 ? ", " : "") << joints_[i]->torq_rescale_;
+        torq_max_summary << (i > 0 ? ", " : "") << joints_[i]->torq_max_;
+    }
+    ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0, "%s_%s: torq_rescale=[%s] torq_max=[%s]", model_.c_str(),
+            id_.c_str(), rescale_summary.str().c_str(), torq_max_summary.str().c_str());
 
     for (int i = 0; i < dof_; i++) {
         tele_pos_.push_back(0);
@@ -624,7 +845,16 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
     // gravity-compensation mode applies zero torque and the arm hangs limp,
     // drooping the moment the operator lets go. Arms whose algo lacks a
     // gravity model (base Algo no-op) still get zero torques.
-    if (role_ == Role::LEADER && cla_.leader_gravity_compensation) {
+    if (role_ == Role::LEADER && cla_.leader_gravity_compensation && is_read_only()) {
+        // Capability cross-validation: a read-only arm (passive encoders, no motors)
+        // cannot produce torque, so gravity compensation is impossible. This is not
+        // fatal -- the operator can still use the arm as a free-moving leader -- so
+        // warn loudly and continue without it.
+        enabled_gravity_compensation_ = false;
+        ARM_CONTROLS_WARN("%s_%s: gravity compensation was requested but this arm is read-only "
+                "(no motors); skipping gravity compensation and continuing as a free-moving leader",
+                model_.c_str(), id_.c_str());
+    } else if (role_ == Role::LEADER && cla_.leader_gravity_compensation) {
         enabled_gravity_compensation_ = true;
         ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
                 "%s_%s: leader gravity compensation enabled (algo_type=%s)",
@@ -637,6 +867,126 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
                 model_.c_str(), id_.c_str());
     }
 
+    // Follower gravity feed-forward: model gravity torque is
+    // sent with every position command so the position gains only correct
+    // tracking error instead of holding the arm against gravity. Independent
+    // of the planning type. Fail fast on arms that cannot honor it -- silently
+    // continuing would run un-compensated gains the operator did not ask for.
+    std::string arm_type;
+    return_code = p_config_model_->get_field_value(p_config_model_->values_, p_config_model_->fn_arm_type, arm_type);
+    if (return_code != ReturnCode::SUCCESS) {
+        ARM_CONTROLS_ERROR("%s_%s: arm type is not defined in the model configuration", model_.c_str(), id_.c_str());
+        return return_code;
+    }
+    const bool is_controller_arm = (arm_type == p_config_model_->val_arm_type_controller);
+
+    if (role_ == Role::FOLLOWER && follower_gravity_requested) {
+        if (is_controller_arm) {
+            // Whole-arm controllers (Trossen) compute gravity/friction compensation inside the
+            // vendor controller in every active mode, so the request is already satisfied without
+            // streaming torque from this node.
+            ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                    "%s_%s: follower gravity compensation ON via the vendor controller "
+                    "(built-in, always active; source: %s)",
+                    model_.c_str(), id_.c_str(), follower_gravity_source);
+        } else if (!supports_torque_feed_forward()) {
+            ARM_CONTROLS_ERROR("%s_%s: follower gravity compensation was requested but this arm type cannot "
+                     "take a torque feed-forward (serial bus servos are position-only). Remove the "
+                     "option for this arm.",
+                     model_.c_str(), id_.c_str());
+            return ReturnCode::NOT_SUPPORTED;
+        } else if (!p_algo_ || !p_algo_->has_gravity_model()) {
+            ARM_CONTROLS_ERROR("%s_%s: follower gravity compensation was requested but the arm has no dynamics "
+                     "model (a URDF-backed algo such as Pinocchio is required).",
+                     model_.c_str(), id_.c_str());
+            return ReturnCode::NOT_INITIALIZED;
+        } else {
+            enabled_gravity_compensation_ = true;
+            follower_gravity_compensation_ = true;
+            ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                    "%s_%s: follower gravity compensation ON (source: %s)",
+                    model_.c_str(), id_.c_str(), follower_gravity_source);
+        }
+    } else if (role_ == Role::FOLLOWER && is_controller_arm) {
+        // The vendor controller has no API to disable its built-in compensation, so an explicit
+        // "off" cannot be honored on controller arms. Warn instead of failing: position tracking
+        // still behaves as it always has on this hardware.
+        ARM_CONTROLS_WARN("%s_%s: follower gravity compensation is requested off (source: %s), but the vendor "
+                "controller's built-in compensation cannot be disabled and stays active",
+                model_.c_str(), id_.c_str(), follower_gravity_source);
+    } else if (role_ == Role::FOLLOWER) {
+        // Explicit OFF trace so an A/B comparison can be reconstructed from the logs alone.
+        ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                "%s_%s: follower gravity compensation OFF (source: %s)",
+                model_.c_str(), id_.c_str(), follower_gravity_source);
+    }
+
+    return ReturnCode::SUCCESS;
+}
+
+ReturnCode DeviceArm::verify_servos_operational() {
+    if (is_read_only()) {
+        return ReturnCode::SUCCESS;
+    }
+
+    // Probe: re-send each joint's last commanded target so every servo answers with a
+    // fresh status frame. DM servos never broadcast spontaneously -- without the probe,
+    // verify_operational() would re-read the stale cache captured during the enable
+    // handshake and miss any error latched since then. Re-sending prev_target_pos_ is
+    // the same "re-assert current command" pattern the recovery stall path uses, so a
+    // healthy servo sees no position change.
+    const auto failed_ids = failed_joint_ids_snapshot();
+    bool any_probe_sent = false;
+    for (auto& p_joint : joints_) {
+        const int16_t sid = p_joint->reference_servo_id();
+        if (sid >= 0 && failed_ids.count(sid) != 0) {
+            continue;
+        }
+        ReturnCode probe_rc = p_joint->move(p_joint->prev_target_pos_);
+        if (probe_rc != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("%s_%s: joint id=%d pre-loop verification probe failed (rc=%d)",
+                     model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(probe_rc));
+            return probe_rc;
+        }
+        any_probe_sent = true;
+    }
+    if (any_probe_sent) {
+        // Flush the probe to the bus. CAN drivers (DriverCanMit) transmit inside move() and this
+        // is a no-op there, but the call keeps the sequence correct for any queued
+        // group-write driver added later.
+        if (p_driver_ != nullptr) {
+            ReturnCode flush_rc = p_driver_->group_write_hardware_values();
+            if (flush_rc != ReturnCode::SUCCESS) {
+                ARM_CONTROLS_ERROR("%s_%s: pre-loop verification probe flush failed (rc=%d)",
+                         model_.c_str(), id_.c_str(), static_cast<int>(flush_rc));
+                return flush_rc;
+            }
+        }
+        usleep(VERIFY_SERVOS_PROBE_WAIT_US);
+    }
+
+    for (auto& p_joint : joints_) {
+        const int16_t sid = p_joint->reference_servo_id();
+        if (sid >= 0 && failed_ids.count(sid) != 0) {
+            continue;
+        }
+        ReturnCode return_code = p_joint->verify_operational();
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("%s_%s: joint id=%d failed pre-loop servo error-state verification (rc=%d); refusing to run",
+                     model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(return_code));
+            return return_code;
+        }
+    }
+
+    if (p_effector_) {
+        ReturnCode effector_rc = p_effector_->verify_servos_operational();
+        if (effector_rc != ReturnCode::SUCCESS) {
+            return effector_rc;
+        }
+    }
+
+    ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0, "%s_%s: pre-loop servo verification passed", model_.c_str(),
+            id_.c_str());
     return ReturnCode::SUCCESS;
 }
 
@@ -676,6 +1026,27 @@ ReturnCode DeviceArm::start(int baud_rate) {
     // step fails or that are already on the failed list get marked failed and skipped --
     // the rest of startup continues so the arm can still reach ready on partial hardware.
     if (is_read_only() == false) {
+        // Refuse to start streaming commands into an arm whose servo carries a
+        // latched error (e.g. a DM communication-loss trip): the motor keeps
+        // reporting positions but produces no torque, so the joint would
+        // collapse under gravity the moment the ready move begins.
+        // verify_operational() attempts one re-enable for DM servos before
+        // failing. Joints already on the failed list (dead bus, tolerated
+        // partial startup) are skipped -- their handling is unchanged.
+        const auto failed_before_verify = failed_joint_ids_snapshot();
+        for (auto& p_joint : joints_) {
+            const int16_t sid = p_joint->reference_servo_id();
+            if (sid >= 0 && failed_before_verify.count(sid) != 0) {
+                continue;
+            }
+            return_code = p_joint->verify_operational();
+            if (return_code != ReturnCode::SUCCESS) {
+                ARM_CONTROLS_ERROR("%s_%s: joint id=%d failed servo error-state verification (rc=%d); aborting start",
+                         model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(return_code));
+                return fail_after_partial_start(return_code);
+            }
+        }
+
         const auto failed_before_hold = failed_joint_ids_snapshot();
         bool any_hold_sent = false;
         for (auto& p_joint : joints_) {
@@ -905,7 +1276,8 @@ ReturnCode DeviceArm::get_observation(MsgJoints& msg) {
 
     for (auto& p_joint : joints_) {
         msg.add_joint_info(p_joint->get_pos_rad_relative(), p_joint->get_vel_rad_sec(), p_joint->get_tor_nm(),
-                           p_joint->get_temperature(), p_joint->get_idc_current());
+                           p_joint->get_temperature(), p_joint->get_idc_current(),
+                           static_cast<float>(p_joint->get_frame_age_ms()));
     }
 
     ///< @todo Assign a dedicated topic channel to effector for independent observation
@@ -918,6 +1290,19 @@ ReturnCode DeviceArm::get_observation(MsgJoints& msg) {
 
 ReturnCode DeviceArm::move_to_ready_position() {
     ReturnCode return_code = ReturnCode::SUCCESS;
+
+    if (is_read_only() == true) {
+        // Read-only arm (e.g. ARX encoder leader): the joints are passive encoders
+        // that cannot be driven, so there is no home to move to. Mark ready
+        // immediately, mirroring the read-only effector path. Without this the
+        // generic stepwise move would command a home it can never reach and only
+        // exit via stuck-detection.
+        ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0, "%s_%s: read-only arm; skipping move to ready position",
+                model_.c_str(), id_.c_str());
+        is_ready_ = true;
+        is_ready_arm_ = true;
+        return ReturnCode::SUCCESS;
+    }
 
     // Scoped to startup so explicit COMMAND_MOVE_TO_READY_POS and
     // emergency-recovery homing still execute with the flag set. Seed every
@@ -959,6 +1344,17 @@ ReturnCode DeviceArm::move_to_ready_position() {
     const std::unordered_set<int16_t> failed_ids = failed_joint_ids_snapshot();
     const float step = ready_move_step_rad();
 
+    // A ready move is still a loaded follower position trajectory. Recompute
+    // the same gravity feed-forward used during normal policy control before
+    // issuing any ready-position commands. Previously the default PARALLEL
+    // branch called Joint::move(position) directly, which writes zero MIT
+    // torque; the first target is almost identical to the measured pose, so
+    // position error initially supplies no restoring torque and the arm sags.
+    return_code = update_follower_feedforward_torques();
+    if (return_code != ReturnCode::SUCCESS) {
+        return return_code;
+    }
+
     if (is_ready_arm_ == false) {
         if (init_count_ < 1) {
             reached_cnt_ = 0;
@@ -987,7 +1383,8 @@ ReturnCode DeviceArm::move_to_ready_position() {
             float worst_displacement = 0.0f;
             int16_t worst_joint_sid = -1;
 
-            for (auto& p_joint : joints_) {
+            for (size_t joint_index = 0; joint_index < joints_.size(); joint_index++) {
+                auto& p_joint = joints_[joint_index];
                 const int16_t sid = p_joint->reference_servo_id();
 
                 // Best-effort: skip joints that have already failed. They cannot accept commands,
@@ -1072,7 +1469,8 @@ ReturnCode DeviceArm::move_to_ready_position() {
                 );
 
 
-                return_code = p_joint->move(new_pos);
+                return_code = move(
+                    p_joint.get(), new_pos, target_tor_[joint_index], p_joint->safe_mode_derating_);
                 if (return_code != ReturnCode::SUCCESS) {
                     ARM_CONTROLS_ERROR("Failed to move joint %d (servo %d) in move_to_ready_position()",
                              p_joint->id_, sid);
@@ -1217,7 +1615,16 @@ ReturnCode DeviceArm::move_to_ready_position() {
                     return ReturnCode::SUCCESS;
                 }
 
-                return_code = move(p_joint, p_joint->target_pos_, 0, p_joint->safe_mode_derating_);
+                const auto joint_it = std::find_if(
+                    joints_.begin(), joints_.end(),
+                    [p_joint](const std::unique_ptr<Joint>& candidate) { return candidate.get() == p_joint; });
+                if (joint_it == joints_.end()) {
+                    ARM_CONTROLS_ERROR("Joint %d is missing from the arm joint list", p_joint->id_);
+                    return ReturnCode::NOT_INITIALIZED;
+                }
+                const size_t joint_index = static_cast<size_t>(std::distance(joints_.begin(), joint_it));
+                return_code = move(
+                    p_joint, p_joint->target_pos_, target_tor_[joint_index], p_joint->safe_mode_derating_);
                 if (return_code != ReturnCode::SUCCESS) {
                     ARM_CONTROLS_ERROR("Failed to move joint %d (servo %d) to target position in move_to_ready_position()",
                              joint_id_to_move, sid);
@@ -1271,8 +1678,11 @@ ReturnCode DeviceArm::move_to_ready_position() {
             return ReturnCode::INVALID_PARAM;
         }
     } else {
-        for (auto& p_joint : joints_) {
-            return_code = move(p_joint.get(), p_joint->get_pos_rad_relative(), 0, p_joint->safe_mode_derating_);
+        for (size_t joint_index = 0; joint_index < joints_.size(); joint_index++) {
+            auto& p_joint = joints_[joint_index];
+            return_code = move(
+                p_joint.get(), p_joint->get_pos_rad_relative(), target_tor_[joint_index],
+                p_joint->safe_mode_derating_);
             if (return_code != ReturnCode::SUCCESS) {
                 ARM_CONTROLS_ERROR("Failed to maintain joint position in move_to_ready_position()");
                 return return_code;
@@ -1428,70 +1838,114 @@ ReturnCode DeviceArm::operate_as_leader() {
 ReturnCode DeviceArm::operate_as_follower() {
     ReturnCode return_code = ReturnCode::SUCCESS;
 
-    if (!p_algo_ && planning_type_ == TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-        ARM_CONTROLS_ERROR("Algorithm handler is not initialized in operate_as_follower()");
-        return ReturnCode::NOT_INITIALIZED;
+    if (is_read_only() == true) {
+        // Read-only arm (e.g. ARX encoder leader): the joints cannot be driven, so
+        // follower tracking is impossible. Role/read_only cross-validation in
+        // Device::init already fast-fails this configuration; the guard here is the
+        // last line of defense if the mode is switched at runtime.
+        ARM_CONTROLS_ERROR("%s_%s is read-only and cannot operate as a follower", model_.c_str(), id_.c_str());
+        return ReturnCode::NOT_SUPPORTED;
     }
 
-    // Reuse pre-allocated vector (reset to zero)
-    std::fill(target_tor_.begin(), target_tor_.end(), 0.0f);
-
-    if (planning_type_ == TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-        // Reuse pre-allocated vector
+    if (gravity_float_active_) {
+        // Calibration gravity float (gravity_tune / arm_check on a follower
+        // node): the joints are in leader control mode, so the arm rests on the
+        // model gravity feed-forward alone -- the exact float the leader path
+        // applies when teleop is disengaged. Live position commands are ignored
+        // until HOLD (or a move-to-ready) re-engages position control.
+        //
+        // In-loop runaway watchdog: judged here (at the control rate), NOT by
+        // the client -- a ZMQ round trip is far too slow, and by the time a
+        // Python monitor reacts the arm has fallen well past the threshold.
         int i = 0;
+        for (auto& p_joint : joints_) {
+            const float drift = p_joint->get_pos_rad_relative() - gravity_float_baseline_[i];
+            if (std::fabs(drift) > gravity_float_abort_rad_) {
+                ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
+                        "%s_%s: gravity float runaway (joint %d drifted %.3f rad > %.3f) -- re-engaging HOLD "
+                        "at the current pose",
+                        model_.c_str(), id_.c_str(), p_joint->id_, drift, gravity_float_abort_rad_);
+                return_code = set_runtime_gravity_float(false, 0.0f);
+                if (return_code != ReturnCode::SUCCESS) {
+                    return return_code;
+                }
+                // Rebase the buffered targets too so no stale pre-float command
+                // yanks the arm after the re-engage.
+                clear_command_buffers_for_move_to_ready();
+                return ReturnCode::SUCCESS;
+            }
+            i++;
+        }
+
+        std::fill(target_tor_.begin(), target_tor_.end(), 0.0f);
+        i = 0;
         for (auto& p_joint : joints_) {
             current_motor_positions_[i++] = p_joint->get_pos_rad_relative() * p_joint->get_dir_invert();
         }
-
         return_code = p_algo_->gravity_compensation(current_motor_positions_, target_tor_);
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Gravity compensation algorithm execution failed for %s_%s", model_.c_str(), id_.c_str());
             return return_code;
         }
-
-        // Empirical per-joint fit on top of the model torques (matches the factors
-        // configured for the same hardware). Defaults to 1.0 when unconfigured.
         i = 0;
         for (auto& p_joint : joints_) {
             target_tor_[i] *= p_joint->gravity_comp_factor_;
-            if (planning_type_ == TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-                target_tor_[i] -= p_joint->follow_viscous_damping_ * p_joint->get_vel_rad_sec();
+            return_code = p_joint->apply_torque(target_tor_[i]);
+            if (return_code != ReturnCode::SUCCESS) {
+                ARM_CONTROLS_ERROR("Failed to apply the gravity float torque to joint %d in %s_%s", p_joint->id_,
+                         model_.c_str(), id_.c_str());
+                return return_code;
             }
             i++;
         }
+        return ReturnCode::SUCCESS;
     }
 
-    float slew_scale = 1.0f;
-    if (planning_type_ == TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-        if (slew_goal_positions_.size() != joints_.size() || control_frequency_ <= 0) {
-            ARM_CONTROLS_ERROR("Invalid synchronized slew state in operate_as_follower() for %s_%s", model_.c_str(),
-                     id_.c_str());
-            return ReturnCode::NOT_INITIALIZED;
-        }
+    return_code = update_follower_feedforward_torques();
+    if (return_code != ReturnCode::SUCCESS) {
+        return return_code;
+    }
 
-        const float dt = 1.0f / static_cast<float>(control_frequency_);
-        int slew_i = 0;
-        for (auto& p_joint : joints_) {
-            const float goal = p_joint->get_safe_tele_pos_rad();
-            slew_goal_positions_[slew_i] = goal;
-            const float delta = std::fabs(goal - p_joint->prev_target_pos_);
-            if (delta > 0.0f) {
-                slew_scale = std::min(slew_scale, p_joint->follow_vel_max_ * dt / delta);
-            }
-            slew_i++;
+    // Synchronized follower slew: bound the tracking velocity by each joint's
+    // follow_vel_max whether or not gravity feed-forward is active. Direct
+    // tracking used to hand the raw leader target to the PD loop, so a 50 Hz
+    // command staircase was traversed as stiff instantaneous steps and
+    // follow_vel_max was silently ignored. One shared scale keeps the
+    // multi-joint motion synchronized (straight line in joint space).
+    if (slew_goal_positions_.size() != joints_.size() || control_frequency_ <= 0) {
+        ARM_CONTROLS_ERROR("Invalid synchronized slew state in operate_as_follower() for %s_%s", model_.c_str(),
+                 id_.c_str());
+        return ReturnCode::NOT_INITIALIZED;
+    }
+
+    // Integrate the slew using the actual
+    // elapsed time between control updates so an overrun does not create
+    // permanent command lag. The nominal period is only a defensive fallback
+    // if this path is reached before the slew clock has been initialized.
+    const auto slew_now = std::chrono::steady_clock::now();
+    float dt = 1.0f / static_cast<float>(control_frequency_);
+    if (follower_slew_last_time_ != std::chrono::steady_clock::time_point{}) {
+        dt = std::max(1e-9f, std::chrono::duration<float>(slew_now - follower_slew_last_time_).count());
+    }
+    follower_slew_last_time_ = slew_now;
+
+    float slew_scale = 1.0f;
+    int slew_i = 0;
+    for (auto& p_joint : joints_) {
+        const float goal = p_joint->get_safe_tele_pos_rad();
+        slew_goal_positions_[slew_i] = goal;
+        const float delta = std::fabs(goal - p_joint->prev_target_pos_);
+        if (delta > 0.0f) {
+            slew_scale = std::min(slew_scale, p_joint->follow_vel_max_ * dt / delta);
         }
+        slew_i++;
     }
 
     int i = 0;
     for (auto& p_joint : joints_) {
-        if (planning_type_ == TrajectoryPlanningType::SLEW_POS_GRAVITY) {
-            const float previous = p_joint->prev_target_pos_;
-            const float cmd = previous + slew_scale * (slew_goal_positions_[i] - previous);
-            return_code = move(p_joint.get(), cmd, target_tor_[i], 1.0);
-        } else {
-            return_code =
-                move(p_joint.get(), p_joint->get_safe_tele_pos_rad(), target_tor_[i], 1.0);
-        }
+        const float previous = p_joint->prev_target_pos_;
+        const float cmd = previous + slew_scale * (slew_goal_positions_[i] - previous);
+        return_code = move(p_joint.get(), cmd, target_tor_[i], 1.0);
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Failed to move joint %d in operate_as_follower() for %s_%s",
                      p_joint->id_, model_.c_str(), id_.c_str());

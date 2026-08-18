@@ -4,6 +4,9 @@
  * device control and management.
  */
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <cmath>
 
 #include "arm_controls_device_effector.hpp"
@@ -94,6 +97,59 @@ ReturnCode DeviceEffector::park_safely() {
     return first_error;
 }
 
+ReturnCode DeviceEffector::verify_servos_operational() {
+    if (is_read_only()) {
+        return ReturnCode::SUCCESS;
+    }
+
+    // Mirror DeviceArm::verify_servos_operational(): probe with a re-send of the last
+    // commanded target so every servo answers with a fresh status frame, then verify.
+    const auto failed_ids = failed_joint_ids_snapshot();
+    bool any_probe_sent = false;
+    for (auto& p_joint : joints_) {
+        const int16_t sid = p_joint->reference_servo_id();
+        if (sid >= 0 && failed_ids.count(sid) != 0) {
+            continue;
+        }
+        ReturnCode probe_rc = p_joint->move(p_joint->prev_target_pos_);
+        if (probe_rc != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("%s_%s: joint id=%d pre-loop verification probe failed (rc=%d)",
+                     model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(probe_rc));
+            return probe_rc;
+        }
+        any_probe_sent = true;
+    }
+    if (any_probe_sent) {
+        // Flush the probe to the bus (see DeviceArm::verify_servos_operational). Called on
+        // the driver directly because write_hardware_values() skips the group write when the
+        // effector shares an arm-owned driver.
+        if (p_driver_ != nullptr) {
+            ReturnCode flush_rc = p_driver_->group_write_hardware_values();
+            if (flush_rc != ReturnCode::SUCCESS) {
+                ARM_CONTROLS_ERROR("%s_%s: pre-loop verification probe flush failed (rc=%d)",
+                         model_.c_str(), id_.c_str(), static_cast<int>(flush_rc));
+                return flush_rc;
+            }
+        }
+        usleep(VERIFY_SERVOS_PROBE_WAIT_US);
+    }
+
+    for (auto& p_joint : joints_) {
+        const int16_t sid = p_joint->reference_servo_id();
+        if (sid >= 0 && failed_ids.count(sid) != 0) {
+            continue;
+        }
+        ReturnCode return_code = p_joint->verify_operational();
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("%s_%s: joint id=%d failed pre-loop servo error-state verification (rc=%d); refusing to run",
+                     model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(return_code));
+            return return_code;
+        }
+    }
+
+    return ReturnCode::SUCCESS;
+}
+
 ReturnCode DeviceEffector::start(int baud_rate) {
     ReturnCode return_code = Device::start(baud_rate);
     if (return_code != ReturnCode::SUCCESS) {
@@ -129,6 +185,23 @@ ReturnCode DeviceEffector::start(int baud_rate) {
     // read-only teaching handles skip this block entirely; their write_hardware_values() and
     // move_to_ready_position() already short-circuit on is_read_only().
     if (is_read_only() == false) {
+        // Mirror DeviceArm::start(): refuse to stream commands into a servo with a
+        // latched error state (silently disabled motor). One re-enable is attempted
+        // inside verify_operational() before failing.
+        const auto failed_before_verify = failed_joint_ids_snapshot();
+        for (auto& p_joint : joints_) {
+            const int16_t sid = p_joint->reference_servo_id();
+            if (sid >= 0 && failed_before_verify.count(sid) != 0) {
+                continue;
+            }
+            return_code = p_joint->verify_operational();
+            if (return_code != ReturnCode::SUCCESS) {
+                ARM_CONTROLS_ERROR("%s_%s: joint id=%d failed servo error-state verification (rc=%d); aborting start",
+                         model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(return_code));
+                return fail_after_partial_start(return_code);
+            }
+        }
+
         const auto failed_before_hold = failed_joint_ids_snapshot();
         bool any_hold_sent = false;
         for (auto& p_joint : joints_) {
@@ -391,7 +464,7 @@ ReturnCode DeviceEffector::init(const CommandLineArgs& cla, int argc,
             "control mode");
     }
 
-    // Torque-mode spring offset (rad): the previous ControlFollowGripper "offset",
+    // Torque-mode spring offset (rad),
     // subtracted from the position error. Installation-specific zero trim;
     // optional, default 0 (prefer adjusting the servo zero instead).
     return_code = p_config_individual_->get_field_value(
@@ -729,7 +802,8 @@ ReturnCode DeviceEffector::get_observation(MsgJoints& msg) {
         msg.add_joint_info(get_normalized_gripper_position(p_joint.get()),
                            p_joint->get_vel_rad_sec(), p_joint->get_tor_nm(),
                            p_joint->get_temperature(),
-                           p_joint->get_idc_current());
+                           p_joint->get_idc_current(),
+                           static_cast<float>(p_joint->get_frame_age_ms()));
     }
 
     return return_code;
@@ -937,25 +1011,39 @@ ReturnCode DeviceEffector::move_to_ready_position() {
         return ReturnCode::SUCCESS;
     }
 
-    // Unified velocity-bounded effector ready move. Step size is identical for every joint
-    // (NORMAL speed for startup/command, ERROR speed during emergency recovery). Time scales
-    // with distance from home; the heartbeat watchdog catches genuine control-loop hangs.
+    // Unified velocity-bounded effector ready move. The ready pose is semantic
+    // normalized position 1.0 (fully open), converted through the effector's
+    // calibrated range and open_at_min polarity. Healthy moves use the
+    // effector-specific rate, capped by the configured joint limit. Reusing
+    // the arm's 0.3 rad/s rate made a full 4.5-5.4 rad gripper stroke take
+    // 15-18 seconds. Emergency recovery deliberately keeps its existing
+    // conservative rate.
+    //
+    // Step size is identical for every effector joint. Time scales with
+    // distance from the ready target; the heartbeat watchdog catches genuine control-loop hangs.
     // Always honour the failed-joint set so communication-failure joints are skipped from the
     // first iteration onward, and treat stuck joints as "within tolerance" for the exit
     // criterion so the ready movement cannot loop forever.
     const std::unordered_set<int16_t> failed_ids = failed_joint_ids_snapshot();
-    const float step = ready_move_step_rad();
+    float ready_velocity = is_slow_move_active()
+                               ? MOVE_TO_READY_VEL_RAD_S_ERROR_EFFECTOR
+                               : MOVE_TO_READY_VEL_RAD_S_NORMAL_EFFECTOR;
+    for (const auto& p_joint : joints_) {
+        ready_velocity = std::min(ready_velocity, p_joint->vel_max_);
+    }
+    const float step = ready_move_step_rad(ready_velocity);
+    const float ready_position = get_gripper_pos_rad_relative_from_normalized(1.0f);
 
     if (init_count_ < 1) {
         reached_cnt_ = 0;
         float max_displacement = 0.0f;
         for (auto& p_joint : joints_) {
-            p_joint->target_pos_ = p_joint->get_home_pos_relative();
+            p_joint->target_pos_ = ready_position;
             const float start_pos = p_joint->get_pos_rad_relative();
             p_joint->prev_target_pos_ = start_pos;
             p_joint->reset_stuck_counter();
             max_displacement = std::max(
-                max_displacement, static_cast<float>(fabs(p_joint->get_home_pos_relative() - start_pos)));
+                max_displacement, static_cast<float>(fabs(ready_position - start_pos)));
         }
         ready_move_budget_init(max_displacement, step);
     }
@@ -1036,7 +1124,11 @@ ReturnCode DeviceEffector::move_to_ready_position() {
                 p_joint->id_, p_joint->target_pos_, new_pos, current_pos, step,
                 p_joint->safe_mode_derating_);
 
-        return_code = p_joint->move(new_pos);
+        // A faster free-space trajectory must not increase squeeze force when
+        // the gripper is blocked by an object. Apply the same symmetric
+        // motor-side force bound used by normal position-mode operation.
+        return_code = p_joint->move(
+            p_joint->clamp_target_to_grip_torque_limit(new_pos));
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR(
                 "Failed to move effector joint %d (servo %d) in move_to_ready_position()",

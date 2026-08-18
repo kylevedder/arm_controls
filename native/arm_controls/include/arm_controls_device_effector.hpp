@@ -87,6 +87,15 @@ class DeviceEffector : public Device {
     virtual ReturnCode start(int baud_rate) override;
 
     /*!
+     * @brief Final pre-loop servo error-state check. Mirrors
+     *        ``DeviceArm::verify_servos_operational()``: probes with a
+     *        re-send of the last commanded target so every servo answers
+     *        with a fresh status frame, then verifies each joint.
+     * @return ReturnCode::SUCCESS when every servo is operational.
+     */
+    ReturnCode verify_servos_operational() override;
+
+    /*!
      * @brief Gets a list of all servo IDs.
      * @param servo_ids Output vector to be populated with servo IDs.
      * @return ReturnCode::SUCCESS if successful.
@@ -242,6 +251,13 @@ class DeviceEffector : public Device {
     }
 
     /*!
+     * @brief Comm-loss policy override: effectors are armed only in TORQUE
+     *        mode (a stale torque command is a runaway grip); position-mode
+     *        effectors keep holding the last position on a CAN loss.
+     */
+    bool wants_comm_loss_stop() override { return control_mode_ == EffectorControlMode::TORQUE; }
+
+    /*!
      * @brief Sets/clears the temporary override used during move-to-ready.
      */
     void set_ready_move_force_position_mode(bool enable) { ready_move_force_position_mode_ = enable; }
@@ -295,6 +311,6 @@ class DeviceEffector : public Device {
     DeviceArm* p_arm_ = nullptr;                  ///< Pointer to the attached arm device.
 
     float distance_to_torque_ = 0.0f;             ///< Distance-to-torque conversion factor (Nm/rad).
-    float grip_spring_offset_ = 0.0f;             ///< Torque-mode spring offset (rad), subtracted from the position error (the previous ControlFollowGripper "offset"; a per-installation zero trim -- prefer adjusting the servo zero).
+    float grip_spring_offset_ = 0.0f;             ///< Torque-mode spring offset (rad), subtracted from the position error; a per-installation zero trim -- prefer adjusting the servo zero.
     bool open_at_min_ = false;              ///< Open side of the effector: true if open at min position, false if open at max position.
 };

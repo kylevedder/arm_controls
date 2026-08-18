@@ -1,6 +1,6 @@
 /*!
  * @file arm_controls_info.cpp
- * @brief Implementation of the arm_controls logging and information output system.
+ * @brief Implementation of logging and information output system for PI Control.
  */
 
 #include <cstdarg>
@@ -84,7 +84,7 @@ void ARM_CONTROLS_ERROR(const std::string msg, ...) {
 
     ///< @note Exception throwing is currently disabled to avoid abrupt program termination
     ///< @todo Implement proper try-catch blocks in acceptable/retriable error paths
-    // ArmControlsException::arm_controls_error(colored_msg);
+    // PiException::arm_controls_error(colored_msg);
 }
 
 Info::Info() {}

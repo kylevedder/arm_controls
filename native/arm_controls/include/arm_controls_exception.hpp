@@ -1,6 +1,6 @@
 /*!
  * @file arm_controls_exception.hpp
- * @brief ArmControlsException class for custom exception handling.
+ * @brief PiException class for custom exception handling.
  */
 
 #pragma once
@@ -8,21 +8,21 @@
 #include <string>
 
 /*!
- * @brief Custom exception class for arm_controls system error handling.
+ * @brief Custom exception class for PI Control system error handling.
  */
-class ArmControlsException : public std::exception {
+class PiException : public std::exception {
    public:
     /*!
      * @brief Constructor.
      * @param message Error message describing the exception.
      */
-    explicit ArmControlsException(const std::string message) : message_(message) {}
+    explicit PiException(const std::string message) : message_(message) {}
 
     /*!
-     * @brief Static helper function to throw an ArmControlsException with an error message.
+     * @brief Static helper function to throw a PiException with an error message.
      * @param message Error message describing the exception.
      */
-    static void arm_controls_error(const std::string& message) { throw ArmControlsException(message); }
+    static void arm_controls_error(const std::string& message) { throw PiException(message); }
 
     /*!
      * @brief Returns the error message as a C-style string.

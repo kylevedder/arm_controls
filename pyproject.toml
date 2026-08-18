@@ -4,15 +4,25 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "arm_controls"
-version = "0.1.0"
-description = "Native C++ robot-control runtime for YAM and ARX robot arms"
+version = "0.1.5"
+description = "Native C++ robot-control runtime for YAM, ARX, SO-ARM101, Trossen, and FR3 robot arms"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
   "numpy>=1.26",
+  # Direct CAN access for the servo zeroing registry (arm_controls.servos).
+  "python-can>=4.3",
   "pyzmq>=25",
+  # Trossen iNerve Ethernet controllers: discovery, EEPROM zeroing, and IP
+  # provisioning (arm_controls.servos.trossen_eth). Pinned to the same
+  # release as the C++ libtrossen_arm in scripts/build_deps.sh so the driver
+  # <-> controller firmware compatibility stays aligned.
+  "trossen-arm==1.10.0; python_version < '3.14'",
+  # USB-serial bus-servo maintenance sessions (arm_controls.servos.buses)
+  # for the FeeTech/Dynamixel serial families (e.g. SO-ARM101).
+  "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +45,7 @@ wheel.install-dir = ""
 sdist.include = [
   "native/**",
   "src/arm_controls/models/**",
+  "src/arm_controls/arm_commands/**",
   "tests/**",
   "scripts/**",
 ]

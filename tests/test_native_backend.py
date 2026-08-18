@@ -9,10 +9,12 @@ message-consumption tests below them run everywhere.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -23,8 +25,10 @@ from arm_controls import (
     ArmMode,
     ArmRole,
     ArmSession,
+    FR3Connection,
     InputLayout,
     PositionCommand,
+    RobotiqConnection,
     SafetyLimits,
     SocketCanConnection,
 )
@@ -120,6 +124,13 @@ def test_live_hardware_fault_preempts_state_timeout():
         backend.read_state(timeout_s=0.0)
 
 
+@pytest.fixture(autouse=True)
+def isolated_log_dir(tmp_path, monkeypatch):
+    """Keep node stdout tee files inside the test sandbox, not ~/arm_controls-data."""
+    monkeypatch.setenv("ARM_CONTROLS_LOG_DIR", str(tmp_path / "logs"))
+    return tmp_path / "logs"
+
+
 @pytest.fixture
 def fake_node(tmp_path, monkeypatch):
     """Routes ARM_CONTROLS_NODE at the protocol-faithful fake node."""
@@ -143,7 +154,61 @@ def fake_node(tmp_path, monkeypatch):
 
 
 def make_backend_config() -> ArmConfig:
-    return ArmConfig("native-test", "Yam", SocketCanConnection("lo"), control_frequency_hz=100)
+    return ArmConfig("native-test", "Yam", SocketCanConnection("lo"))
+
+
+@pytest.mark.parametrize(
+    ("gripper", "expected_transport", "expected_endpoint"),
+    [
+        (RobotiqConnection.rtu("/dev/null"), "rtu", "/dev/null"),
+        (RobotiqConnection.tcp("192.168.1.12", port=1502), "tcp", "192.168.1.12"),
+    ],
+)
+def test_native_backend_forwards_fr3_and_robotiq_arguments(
+    monkeypatch,
+    gripper: RobotiqConnection,
+    expected_transport: str,
+    expected_endpoint: str,
+) -> None:
+    captured_args: list[str] = []
+    backend = NativeArmBackend()
+    config = ArmConfig(
+        "fr3-follower",
+        "FR3",
+        FR3Connection("192.168.1.10"),
+        effector_model="Robotiq",
+        effector_connection=gripper,
+    )
+
+    def capture_spawn(args, **_kwargs):
+        captured_args.extend(args)
+        raise RuntimeError("captured native arguments")
+
+    monkeypatch.setattr("arm_controls.native.platform.system", lambda: "Linux")
+    monkeypatch.setattr("arm_controls.native.native_executable", lambda: Path(sys.executable))
+    monkeypatch.setattr("arm_controls.native.subprocess.Popen", capture_spawn)
+
+    try:
+        with pytest.raises(RuntimeError, match="captured native arguments"):
+            backend.connect(
+                config,
+                ArmRole.FOLLOWER,
+                topics_for(f"fr3-{expected_transport}", "fr3-follower"),
+            )
+    finally:
+        backend.close()
+
+    def value_after(option: str) -> str:
+        return captured_args[captured_args.index(option) + 1]
+
+    assert value_after("--device_model") == "FR3"
+    assert value_after("--fr3_address") == "192.168.1.10"
+    assert value_after("--robotiq_transport") == expected_transport
+    assert value_after("--robotiq_endpoint") == expected_endpoint
+    assert value_after("--robotiq_port") == ("1502" if expected_transport == "tcp" else "502")
+    assert value_after("--algo_type") == "None"
+    assert "--control_port" not in captured_args
+    assert "--urdf_path" not in captured_args
 
 
 @pytest.mark.parametrize("safety_torque_mode", [False, True])
@@ -156,7 +221,6 @@ def test_native_backend_forwards_safety_torque_mode_only_when_enabled(
         "native-test",
         "Yam",
         SocketCanConnection("lo"),
-        control_frequency_hz=100,
         safety_torque_mode=safety_torque_mode,
     )
 
@@ -180,6 +244,8 @@ def test_native_backend_forwards_safety_torque_mode_only_when_enabled(
         backend.close()
 
     assert ("--safety_torque_mode" in captured_args) is safety_torque_mode
+    frequency_index = captured_args.index("--control_frequency")
+    assert captured_args[frequency_index + 1] == "200"
 
 
 @pytest.mark.parametrize(("model", "expected_present"), [("ARX_X5", False), ("Yam", True)])
@@ -192,7 +258,6 @@ def test_native_backend_forwards_leader_gravity_compensation_default(
         "native-test",
         model,
         SocketCanConnection("lo"),
-        control_frequency_hz=100,
     )
 
     def capture_spawn(args, **_kwargs):
@@ -215,6 +280,8 @@ def test_native_backend_forwards_leader_gravity_compensation_default(
         backend.close()
 
     assert ("--leader_gravity_compensation" in captured_args) is expected_present
+    frequency_index = captured_args.index("--control_frequency")
+    assert captured_args[frequency_index + 1] == "200"
 
 
 def test_publisher_closes_socket_when_bind_candidates_are_exhausted():
@@ -470,6 +537,38 @@ def test_full_lifecycle_against_fake_node(fake_node):
 
 
 @spawn_tests
+def test_node_stdout_is_teed_to_persistent_log_file(fake_node, isolated_log_dir):
+    fake_node("normal")
+    backend = NativeArmBackend()
+    try:
+        backend.connect(
+            make_backend_config(), ArmRole.FOLLOWER, topics_for("t-tee", "native-test")
+        )
+    finally:
+        backend.close()
+
+    tee_path = isolated_log_dir / "arm_controls_node__follower__native-test__Yam.log"
+    assert tee_path.is_file()
+    first_run_content = tee_path.read_text()
+    assert first_run_content
+
+    # A second run must rotate (preserve) the first run's file, not overwrite it.
+    try:
+        backend.connect(
+            make_backend_config(), ArmRole.FOLLOWER, topics_for("t-tee2", "native-test")
+        )
+    finally:
+        backend.close()
+    rotated = [
+        path
+        for path in isolated_log_dir.iterdir()
+        if path.name.startswith("arm_controls_node__follower__native-test__Yam__")
+    ]
+    assert len(rotated) == 1
+    assert rotated[0].read_text() == first_run_content
+
+
+@spawn_tests
 def test_backend_can_reconnect_after_close(fake_node):
     fake_node("normal")
     backend = NativeArmBackend()
@@ -596,11 +695,11 @@ def test_session_disengages_pair_before_reconnecting_dead_arm(fake_node):
     follower_backend = NativeArmBackend()
     session = ArmSession(session_id="t-pair-exited-reconnect")
     leader = session.add_leader(
-        ArmConfig("native-leader", "Yam", SocketCanConnection("lo"), control_frequency_hz=100),
+        ArmConfig("native-leader", "Yam", SocketCanConnection("lo")),
         backend=leader_backend,
     )
     follower = session.add_follower(
-        ArmConfig("native-follower", "Yam", SocketCanConnection("lo"), control_frequency_hz=100),
+        ArmConfig("native-follower", "Yam", SocketCanConnection("lo")),
         backend=follower_backend,
     )
     pair = session.add_pair(
@@ -774,18 +873,23 @@ def pack_state(
     efforts: list[float] | None = None,
     temperatures: list[float] | None = None,
     currents: list[float] | None = None,
+    frame_ages: list[float] | None = None,
 ) -> bytes:
     padded = positions + [0.0] * (10 - len(positions))
     arrays = []
     for values in (velocities, efforts, temperatures, currents):
         values = values or []
         arrays.append(values + [0.0] * (10 - len(values)))
+    # Default to fresh frames (small constant age) unless a test overrides it.
+    ages = frame_ages if frame_ages is not None else [2.0] * 10
+    ages = ages + [0.0] * (10 - len(ages))
     return JOINT_STRUCT.pack(
         *padded,
         *arrays[0],
         *arrays[1],
         *arrays[2],
         *arrays[3],
+        *ages,
         sequence,
         joint_count,
         1,
@@ -863,6 +967,7 @@ def test_consume_state_extracts_effector_when_extra_joint_present():
             efforts=[0.0] * 6 + [1.1],
             temperatures=[25.0] * 6 + [72.0],
             currents=[0.0] * 6 + [2.3],
+            frame_ages=[5.0] * 6 + [321.0],
         )
     )
     assert backend._state is not None
@@ -872,7 +977,101 @@ def test_consume_state_extracts_effector_when_extra_joint_present():
     assert backend._state.effector.effort_nm == pytest.approx(1.1)
     assert backend._state.effector.temperature_c == pytest.approx(72.0)
     assert backend._state.effector.current_a == pytest.approx(2.3)
+    assert backend._state.effector.frame_age_ms == pytest.approx(321.0)
+    assert backend._state.joints.frame_age_ms == pytest.approx([5.0] * 6)
     backend.close()
+
+
+def test_subscriber_recv_latest_returns_newest_and_counts_discards():
+    context = zmq.Context()
+    publisher = _Publisher(context, "t-recv-latest")
+    subscriber = _Subscriber(context, "t-recv-latest")
+    try:
+        # PUB/SUB slow joiner: keep probing until the subscription propagates.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            publisher.send(b"probe")
+            payload, _ = subscriber.recv_latest()
+            if payload is not None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("subscriber never received the probe message")
+
+        for index in range(20):
+            publisher.send(bytes([index]))
+            time.sleep(0.001)  # let the io thread flush past the SNDHWM of 2
+
+        latest: bytes | None = None
+        discarded_total = 0
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and latest != bytes([19]):
+            payload, discarded = subscriber.recv_latest()
+            discarded_total += discarded
+            if payload is not None:
+                latest = payload
+            time.sleep(0.01)
+
+        assert latest == bytes([19])
+        assert discarded_total >= 1
+    finally:
+        publisher.close()
+        subscriber.close()
+        context.term()
+
+
+class QueueSubscriber:
+    """Reader-loop test double mirroring the _Subscriber drain interface."""
+
+    def __init__(self, payloads: list[bytes]) -> None:
+        self.queue = deque(payloads)
+
+    def recv(self) -> bytes | None:
+        return self.queue.popleft() if self.queue else None
+
+    def recv_latest(self) -> tuple[bytes | None, int]:
+        latest: bytes | None = None
+        discarded = 0
+        while self.queue:
+            if latest is not None:
+                discarded += 1
+            latest = self.queue.popleft()
+        return latest, discarded
+
+    def close(self) -> None:
+        self.queue.clear()
+
+
+def test_reader_loop_consumes_state_backlog_as_single_newest_sample(caplog):
+    backend = make_consuming_backend()
+    backlog = [pack_state([0.001 * index] * 6, sequence=index + 1) for index in range(60)]
+    backend._state_sub = QueueSubscriber(backlog)
+    backend._running = True
+    reader = threading.Thread(target=backend._reader_loop)
+    backend._reader = reader
+
+    with caplog.at_level(logging.WARNING, logger="arm_controls.native"):
+        try:
+            reader.start()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with backend._condition:
+                    if backend._state is not None:
+                        break
+                time.sleep(0.005)
+        finally:
+            with backend._condition:
+                backend._running = False
+            reader.join(timeout=2.0)
+            backend.close()
+
+    assert not reader.is_alive()
+    assert backend._state is not None
+    # Only the newest sample is observed; the 59 stale ones are discarded
+    # instead of being replayed one per poll (which would lag the state feed).
+    assert backend._state.joints.position_rad == pytest.approx([0.001 * 59] * 6)
+    assert backend._state_generation == 1
+    assert any("59 stale state message(s)" in record.getMessage() for record in caplog.records)
 
 
 def test_read_state_returns_next_packet_when_sequence_repeats():
@@ -965,6 +1164,47 @@ def test_consume_status_mode_update_replaces_state_mode():
     # An out-of-range mode index is ignored rather than crashing the reader.
     backend._consume_status(pack_status(NativeStatus.MODE, (250,)))
     assert backend._state.mode is ArmMode.RECOVERY
+    backend.close()
+
+
+def test_consume_status_servo_param_populates_reports():
+    # One DEVICE_INFO_SERVO_PARAM message per joint: effective codec ranges,
+    # the motor-reported firmware ranges (gravity_tune compares them across arms
+    # before assuming one torq_rescale calibration fits both), the applied
+    # torq_rescale, the position gains (milli-units in the int slots — the wire
+    # format caps a message at 10 floats) and the gravity feed-forward flag.
+    backend = make_consuming_backend()
+    # Exactly representable in the wire float32 so the assertions compare equal.
+    floats = (-21.0, 21.0, -30.0, 30.0, -20.5, 20.5, -42.0, 42.0, 0.75)
+    backend._consume_status(
+        STATUS_STRUCT.pack(
+            int(NativeStatus.SERVO_PARAM), len(floats), 6,
+            *(floats + (0.0,) * (10 - len(floats))),
+            *((1, 1, 1, 1, 40000, 1500) + (0,) * 4),
+        )
+    )
+    # A joint without a range query (DM wrist): valid flags 0 -> reported None.
+    backend._consume_status(
+        STATUS_STRUCT.pack(
+            int(NativeStatus.SERVO_PARAM), len(floats), 6,
+            *(floats + (0.0,) * (10 - len(floats))),
+            *((3, 0, 0, 0, 25500, 800) + (0,) * 4),
+        )
+    )
+    reports = backend.servo_reports()
+    assert reports[1].codec_vel_range == (-21.0, 21.0)
+    assert reports[1].codec_tor_range == (-30.0, 30.0)
+    assert reports[1].reported_spd_range == (-20.5, 20.5)
+    assert reports[1].reported_tor_range == (-42.0, 42.0)
+    assert reports[1].torq_rescale == 0.75
+    assert reports[1].pos_kp == 40.0
+    assert reports[1].pos_kd == 1.5
+    assert reports[1].gravity_feed_forward is True
+    assert reports[3].reported_spd_range is None
+    assert reports[3].reported_tor_range is None
+    assert reports[3].pos_kp == 25.5
+    assert reports[3].pos_kd == 0.8
+    assert reports[3].gravity_feed_forward is False
     backend.close()
 
 
@@ -1599,12 +1839,12 @@ def test_close_waits_for_active_subscriber_receive_before_closing_it():
             self.receiving = False
             self.closed_during_receive = False
 
-        def recv(self):
+        def recv_latest(self):
             self.receiving = True
             self.receive_started.set()
             assert self.release_receive.wait(timeout=3.0)
             self.receiving = False
-            return None
+            return None, 0
 
         def close(self):
             self.closed_during_receive = self.receiving
@@ -1643,7 +1883,7 @@ def test_stale_reader_failure_cannot_stop_a_reconnected_backend():
             self.receive_started = threading.Event()
             self.release_receive = threading.Event()
 
-        def recv(self):
+        def recv_latest(self):
             self.receive_started.set()
             assert self.release_receive.wait(timeout=2.0)
             raise RuntimeError("retired reader failed")

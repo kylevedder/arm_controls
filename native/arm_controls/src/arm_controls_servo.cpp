@@ -10,7 +10,9 @@
 
 #include "arm_controls_joint.hpp"
 #include "arm_controls_servo_can_encoder.hpp"
+#include "arm_controls_servo_controller.hpp"
 #include "arm_controls_servo_dm.hpp"
+#include "arm_controls_servo_ft.hpp"
 
 #define MAX_CNT_POS_EXCEED \
     100  ///< Threshold count for position limit exceed detection
@@ -139,6 +141,49 @@ ReturnCode Servo::init_config_model(const json& servo_config,
         }
     }
 
+    // Sign-agnostic position reads for read-only encoders whose feedback sign
+    // varies per unit (e.g. the ARX_ENC gripper: the vendor reference applies
+    // abs() so left/right gripper hardware read identically). Optional field;
+    // when present, a malformed value aborts startup.
+    if (servo_config.contains(p_config->fn_servo_abs_position)) {
+        return_code = p_config->get_field_value(
+            servo_config, p_config->fn_servo_abs_position, abs_position_);
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("Servo ID %d: abs_position must be a boolean in the model configuration file", id_);
+            return return_code;
+        }
+        ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1, "Servo ID %d: abs_position=%s (from model config)",
+                id_, abs_position_ ? "true" : "false");
+    }
+
+    // Config format 1.1.1+ places the position limits in the model configuration
+    // servo block; the individual configuration may still override them below.
+    return_code = p_config->get_field_value(
+        servo_config, p_config->fn_servo_pos_min, pos_min_rel_);
+    if (return_code == ReturnCode::SUCCESS) {
+        pos_min_configured_ = true;
+        ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1,
+                "Servo ID %d: pos_min=%.3f (from model config)", id_,
+                pos_min_rel_);
+    }
+
+    return_code = p_config->get_field_value(
+        servo_config, p_config->fn_servo_pos_max, pos_max_rel_);
+    if (return_code == ReturnCode::SUCCESS) {
+        pos_max_configured_ = true;
+        ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1,
+                "Servo ID %d: pos_max=%.3f (from model config)", id_,
+                pos_max_rel_);
+
+        if (pos_min_configured_ && pos_max_rel_ < pos_min_rel_) {
+            ARM_CONTROLS_ERROR(
+                "Servo ID %d: pos_max (%.3f) is smaller than pos_min (%.3f) "
+                "in model configuration file",
+                id_, pos_max_rel_, pos_min_rel_);
+            return ReturnCode::INVALID_PARAM;
+        }
+    }
+
     return_code = init_current_estimation(servo_model_, p_config);
     if (return_code != ReturnCode::SUCCESS) {
         ARM_CONTROLS_ERROR("Failed to initialize current estimation (servo ID %d)", id_);
@@ -151,8 +196,6 @@ ReturnCode Servo::init_config_model(const json& servo_config,
 ReturnCode Servo::init_config_individual(const json& servo_config,
                                          const DeviceConfig* p_config) {
     ReturnCode return_code;
-    bool pos_min_configured = false;
-    bool pos_max_configured = false;
     position_wrap_period_ = 0;
     position_wrap_offset_rel_ = 0;
     position_wrap_initialized_ = false;
@@ -176,10 +219,41 @@ ReturnCode Servo::init_config_individual(const json& servo_config,
         dir_invert_ = dir_invert_individual;
     }
 
+    // Position-gain overrides: an instance config can select a site-specific
+    // gain profile (e.g. the high-gain kp/kd variant for A/B benchmarking)
+    // without editing the gains bundled in the model config.
+    float gain_override = 0;
+    return_code = p_config->get_field_value(
+        servo_config, p_config->fn_servo_pos_kp, gain_override);
+    if (return_code == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Servo", InfoLevel::ESSENTIAL_0,
+                "Servo ID %d: pos_kp overridden by individual config: %.3f -> %.3f",
+                id_, pos_kp_, gain_override);
+        pos_kp_ = gain_override;
+    }
+
+    return_code = p_config->get_field_value(
+        servo_config, p_config->fn_servo_pos_ki, gain_override);
+    if (return_code == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Servo", InfoLevel::ESSENTIAL_0,
+                "Servo ID %d: pos_ki overridden by individual config: %.3f -> %.3f",
+                id_, pos_ki_, gain_override);
+        pos_ki_ = gain_override;
+    }
+
+    return_code = p_config->get_field_value(
+        servo_config, p_config->fn_servo_pos_kd, gain_override);
+    if (return_code == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Servo", InfoLevel::ESSENTIAL_0,
+                "Servo ID %d: pos_kd overridden by individual config: %.3f -> %.3f",
+                id_, pos_kd_, gain_override);
+        pos_kd_ = gain_override;
+    }
+
     return_code = p_config->get_field_value(
         servo_config, p_config->fn_servo_pos_min, pos_min_rel_);
     if (return_code == ReturnCode::SUCCESS) {
-        pos_min_configured = true;
+        pos_min_configured_ = true;
         ARM_CONTROLS_INFO("Servo", InfoLevel::ESSENTIAL_0, "Servo ID %d: pos_min=%.3f",
                 id_, pos_min_rel_);
     }
@@ -187,16 +261,15 @@ ReturnCode Servo::init_config_individual(const json& servo_config,
     return_code = p_config->get_field_value(
         servo_config, p_config->fn_servo_pos_max, pos_max_rel_);
     if (return_code == ReturnCode::SUCCESS) {
-        pos_max_configured = true;
+        pos_max_configured_ = true;
         ARM_CONTROLS_INFO("Servo", InfoLevel::ESSENTIAL_0, "Servo ID %d: pos_max=%.3f",
                 id_, pos_max_rel_);
+    }
 
-        if (pos_max_rel_ < pos_min_rel_) {
-            ARM_CONTROLS_ERROR(
-                "Servo ID %d: pos_max (%.3f) is smaller than pos_min (%.3f)",
-                id_, pos_max_rel_, pos_min_rel_);
-            return ReturnCode::INVALID_PARAM;
-        }
+    if (pos_min_configured_ && pos_max_configured_ && pos_max_rel_ < pos_min_rel_) {
+        ARM_CONTROLS_ERROR("Servo ID %d: pos_max (%.3f) is smaller than pos_min (%.3f)",
+                 id_, pos_max_rel_, pos_min_rel_);
+        return ReturnCode::INVALID_PARAM;
     }
 
     return_code = p_config->get_field_value(
@@ -210,10 +283,10 @@ ReturnCode Servo::init_config_individual(const json& servo_config,
         servo_config, p_config->fn_servo_position_wrap_period,
         position_wrap_period_);
     if (return_code == ReturnCode::SUCCESS) {
-        if (!pos_min_configured || !pos_max_configured) {
+        if (!pos_min_configured_ || !pos_max_configured_) {
             ARM_CONTROLS_ERROR(
                 "Servo ID %d: position_wrap_period requires pos_min and "
-                "pos_max in the individual configuration",
+                "pos_max in the model or individual configuration",
                 id_);
             return ReturnCode::INVALID_PARAM;
         }
@@ -334,7 +407,8 @@ ReturnCode Servo::new_servos(const json& joint_config,
         std::unique_ptr<Servo> p_servo;
         if (servo_model == p_config_model->val_servo_model_dm_4340 ||
             servo_model == p_config_model->val_servo_model_dm_4310 ||
-            servo_model == p_config_model->val_servo_model_encos_A4310) {
+            servo_model == p_config_model->val_servo_model_encos_A4310 ||
+            servo_model == p_config_model->val_servo_model_arx_encoder) {
             p_servo = std::make_unique<ServoDm>(p_device, p_joint, p_driver);
             ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1, "Created ServoDm instance");
 
@@ -344,6 +418,13 @@ ReturnCode Servo::new_servos(const json& joint_config,
                                                                p_driver);
             ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1,
                     "Created ServoCanPassiveEncoder instance");
+        } else if (servo_model == p_config_model->val_servo_model_trossen_wxai) {
+            p_servo = std::make_unique<ServoController>(p_device, p_joint, p_driver);
+            ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1,
+                    "Created ServoController instance");
+        } else if (servo_model == p_config_model->val_servo_model_ft_sts3215) {
+            p_servo = std::make_unique<ServoFt>(p_device, p_joint, p_driver);
+            ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1, "Created ServoFt instance");
         } else {
             ARM_CONTROLS_ERROR("Unsupported servo model: %s", servo_model.c_str());
             return ReturnCode::NOT_SUPPORTED;

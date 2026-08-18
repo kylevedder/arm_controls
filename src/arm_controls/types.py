@@ -29,6 +29,11 @@ class ArmRole(StrEnum):
     LEADER = "leader"
     FOLLOWER = "follower"
 
+    @property
+    def control_frequency_hz(self) -> int:
+        """Canonical control-loop rate for this role."""
+        return 200
+
 
 class ArmMode(StrEnum):
     DISCONNECTED = "disconnected"
@@ -44,7 +49,14 @@ class ArmMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class JointState:
-    """Joint state. Position is rad, velocity rad/s, effort Nm, current A."""
+    """Joint state. Position is rad, velocity rad/s, effort Nm, current A.
+
+    ``frame_age_ms`` is the age of the hardware feedback frame backing each
+    joint's position when the native node published it (-1 = unknown or the
+    backend does not track per-joint freshness). It exposes a stale driver
+    cache that would otherwise be invisible: the node keeps republishing the
+    last cached position when CAN frames stop arriving.
+    """
 
     names: tuple[str, ...]
     position_rad: FloatArray
@@ -52,6 +64,7 @@ class JointState:
     effort_nm: FloatArray
     temperature_c: FloatArray
     current_a: FloatArray
+    frame_age_ms: FloatArray | None = None
 
     def __post_init__(self) -> None:
         fields = ("position_rad", "velocity_rad_s", "effort_nm", "temperature_c", "current_a")
@@ -60,19 +73,32 @@ class JointState:
         expected = len(self.names)
         if expected == 0:
             raise ConfigurationError("joint state must contain at least one joint")
-        if any(getattr(self, name).size != expected for name in fields):
+        if self.frame_age_ms is None:
+            object.__setattr__(
+                self, "frame_age_ms", readonly_array([-1.0] * expected, name="frame_age_ms")
+            )
+        else:
+            object.__setattr__(
+                self, "frame_age_ms", readonly_array(self.frame_age_ms, name="frame_age_ms")
+            )
+        if any(getattr(self, name).size != expected for name in (*fields, "frame_age_ms")):
             raise ConfigurationError("all joint state arrays must match the joint name count")
 
 
 @dataclass(frozen=True, slots=True)
 class EffectorState:
-    """Effector state. Position is normalized to [0, 1]."""
+    """Effector state. Position is normalized to [0, 1].
+
+    ``frame_age_ms`` mirrors :attr:`JointState.frame_age_ms` for the gripper
+    servo (-1 = unknown).
+    """
 
     position: float
     velocity_s: float = 0.0
     effort_nm: float = 0.0
     temperature_c: float = 0.0
     current_a: float = 0.0
+    frame_age_ms: float = -1.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.position <= 1.0:
@@ -163,6 +189,33 @@ class PositionCommand:
             raise ConfigurationError("position command must contain at least one joint")
         if self.effector is not None and not 0.0 <= self.effector <= 1.0:
             raise ConfigurationError("effector command must be normalized to [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class JointServoReport:
+    """One joint's servo parameters as the native node reports them.
+
+    The codec ranges scale every wire command/status; the reported ranges come
+    from the motor's own firmware registers (ENCOS range query) and expose
+    batch differences (e.g. TOR registers of 30 vs 42 Nm) that make one
+    torq_rescale calibration invalid for another arm. Reported ranges are None
+    for motor families without a range query.
+
+    torq_rescale, pos_kp and pos_kd are the values the node actually applies
+    (after every config layer and runtime update), so consumers such as the
+    rollout dump can record the effective calibration without re-deriving it
+    from config files. gravity_feed_forward is device-level (the follower
+    gravity feed-forward on/off state) and repeats on every joint's report.
+    """
+
+    codec_vel_range: tuple[float, float]
+    codec_tor_range: tuple[float, float]
+    reported_spd_range: tuple[float, float] | None
+    reported_tor_range: tuple[float, float] | None
+    torq_rescale: float
+    pos_kp: float
+    pos_kd: float
+    gravity_feed_forward: bool
 
 
 @dataclass(frozen=True, slots=True)

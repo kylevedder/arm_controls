@@ -31,6 +31,7 @@
 #define DEVICE_COMMAND_SET_FORCE_FEEDBACK_GAIN     32
 #define DEVICE_COMMAND_HOLD                        33
 #define DEVICE_COMMAND_HEARTBEAT                   34  ///< Client-liveness heartbeat; payload-free, arms the dead-client watchdog.
+#define DEVICE_COMMAND_SET_TORQ_RESCALE            35  ///< Runtime per-joint torq_rescale update (float params, one per arm joint).
 
 #define DEVICE_INFO_READY_NOW 1  ///< Device is ready; param_int[0] is the completed lifecycle request id, if any.
 #define DEVICE_INFO_EFFECTOR  10 ///< Device info code indicating that the device is an effector.
@@ -59,6 +60,16 @@
 #define DEVICE_INFO_PROTOCOL_HANDSHAKE 30
 #define DEVICE_INFO_COMMAND_ACK        31
 #define DEVICE_INFO_RUNTIME_MODE       32
+// Per-joint servo parameter report (one message per arm joint, re-announced with the
+// handshake so late subscribers always receive it):
+//   param_int[0]   = joint index (0-based)
+//   param_int[1]   = motor answered the SPD-range query (0/1)
+//   param_int[2]   = motor answered the TOR-range query (0/1)
+//   param_float[0..1] = effective codec velocity range min/max (rad/s)
+//   param_float[2..3] = effective codec torque range min/max (Nm)
+//   param_float[4..5] = motor-reported SPD range min/max (rad/s; valid per param_int[1])
+//   param_float[6..7] = motor-reported TOR range min/max (Nm; valid per param_int[2])
+#define DEVICE_INFO_SERVO_PARAM        33
 
 #define ARM_CONTROLS_PROTOCOL_VERSION_MAJOR 1
 #define ARM_CONTROLS_PROTOCOL_VERSION_MINOR 1
@@ -96,6 +107,7 @@ class DataJoint {
     float curr_tor_;    ///< Current torque of the joint (Nm).
     float temperature_; ///< Current temperature of the joint (degrees Celsius).
     float idc_current_; ///< Input DC current of the joint (A).
+    float frame_age_ms_; ///< Age of the hardware frame backing curr_pos_ (ms, -1 = unknown).
 };
 
 /*!
@@ -114,14 +126,18 @@ class MsgJoints {
      * @param curr_tor Joint torque (Nm).
      * @param temperature Joint temperature (degrees Celsius).
      * @param idc_current Joint DC current (A).
+     * @param frame_age_ms Age of the hardware frame backing the position (ms,
+     *        -1 when the source has no per-joint freshness, e.g. command ingest).
      */
-    void add_joint_info(float curr_pos_rel, float curr_vel, float curr_tor, float temperature, float idc_current) {
+    void add_joint_info(float curr_pos_rel, float curr_vel, float curr_tor, float temperature, float idc_current,
+                        float frame_age_ms) {
         DataJoint data_joint;
         data_joint.curr_pos_ = curr_pos_rel;
         data_joint.curr_vel_ = curr_vel;
         data_joint.curr_tor_ = curr_tor;
         data_joint.temperature_ = temperature;
         data_joint.idc_current_ = idc_current;
+        data_joint.frame_age_ms_ = frame_age_ms;
         joints_.push_back(data_joint);
     }
 };

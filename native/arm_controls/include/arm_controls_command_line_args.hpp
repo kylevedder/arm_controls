@@ -4,6 +4,7 @@
  */
 #pragma once
 #include <string>
+#include <vector>
 
 #define OPT_ROLE                                  "role"              ///< Device role option.
 #define OPT_ROLE_LEADER                           "leader"            ///< Leader role value.
@@ -16,6 +17,7 @@
 #define OPT_EFFECTOR_MODEL                        "effector_model"   ///< Effector model option.
 #define OPT_EFFECTOR_ID                           "effector_id"      ///< Effector ID option.
 #define OPT_CONTROL_PORT                          "control_port"     ///< Control port option.
+#define OPT_BAUD_RATE                             "baud_rate"        ///< Baud rate option (serial buses).
 #define OPT_INFO_LEVEL                            "info_level"       ///< Logging level option.
 #define OPT_INFO_GROUPS                           "info_groups"      ///< Information groups option.
 #define OPT_TOPIC_JOINT                           "topic_joint"      ///< Joint topic option.
@@ -55,7 +57,9 @@
 #define OPT_DEFAULT_NONE                          "None"             ///< Default "none" value.
 #define OPT_PLANING_TYPE                          "planning_type"    ///< Planning type option.
 #define OPT_PLANING_TYPE_DEFAULT                  "config"           ///< Default planning type value.
-#define OPT_ARM_PLANNING_TYPE                     "arm_planning_type"  ///< Planning type override applied to ARM devices only.
+#define OPT_FOLLOWER_GRAVITY_COMPENSATION         "follower_gravity_compensation"  ///< Follower gravity feed-forward override (config/true/false).
+#define OPT_FOLLOWER_GRAVITY_COMPENSATION_DEFAULT "config"           ///< Default: the arm's individual config JSON decides.
+#define OPT_TORQ_RESCALE                          "torq_rescale"     ///< Per-joint torq_rescale override (comma-separated floats).
 #define OPT_FORCE_FEEDBACK                        "force_feedback"   ///< Force feedback option.
 #define OPT_TOPIC_STATE                           "topic_state"
 #define OPT_TOPIC_LIVE_COMMAND                    "topic_live_command"
@@ -68,6 +72,21 @@
 #define OPT_EFFECTOR_MODEL_CONFIG                 "effector_model_config"
 #define OPT_EFFECTOR_INSTANCE_CONFIG              "effector_instance_config"
 #define OPT_URDF_PATH                             "urdf_path"
+// Read end of the supervising Python process's lifeline pipe.
+#define OPT_PARENT_LIVENESS_FD                    "parent_liveness_fd"
+#define OPT_FR3_ADDRESS                           "fr3_address"
+#define OPT_FR3_RESET_POSE                        "fr3_reset_pose"
+#define OPT_ROBOTIQ_TRANSPORT                     "robotiq_transport"
+#define OPT_ROBOTIQ_ENDPOINT                      "robotiq_endpoint"
+#define OPT_ROBOTIQ_PORT                          "robotiq_port"
+#define OPT_ROBOTIQ_BAUD_RATE                     "robotiq_baud_rate"
+#define OPT_ROBOTIQ_SLAVE_ID                      "robotiq_slave_id"
+#define OPT_ROBOTIQ_POLL_FREQUENCY                "robotiq_poll_frequency"
+#define OPT_ROBOTIQ_TIMEOUT_MS                    "robotiq_timeout_ms"
+#define OPT_ROBOTIQ_MIN_POSITION_RAW              "robotiq_min_position_raw"
+#define OPT_ROBOTIQ_MAX_POSITION_RAW              "robotiq_max_position_raw"
+#define OPT_ROBOTIQ_DEFAULT_SPEED                 "robotiq_default_speed"
+#define OPT_ROBOTIQ_DEFAULT_FORCE                 "robotiq_default_force"
 
 
 // Unified move-to-ready / emergency-recovery options. Every "move to ready" path (startup,
@@ -102,6 +121,7 @@ class CommandLineArgs {
     std::string topic_joystick;           ///< Joystick topic name.
     std::string info_groups;              ///< Information groups (comma-separated).
     std::string control_port_name;        ///< Control port name.
+    int baud_rate;                        ///< Baud rate for serial buses (bps).
     int info_level;                       ///< Logging level.
     int dof_arm;                          ///< Arm DOF.
     int servo_num_arm;                    ///< Arm servo count.
@@ -125,7 +145,14 @@ class CommandLineArgs {
     bool safety_feature_off;              ///< Disable safety features flag.
     bool safety_torque_mode = false;       ///< Enable sustained measured-torque protective stops.
     std::string planning_type;            ///< Planning type.
-    std::string arm_planning_type;        ///< Planning type override for ARM devices only (empty/None = model config).
+    ///< Follower gravity feed-forward override: "config" leaves the decision to the
+    ///< follower_gravity_compensation field of the arm's individual config JSON;
+    ///< "true"/"false" (from devices.toml) force it regardless of the JSON value.
+    std::string follower_gravity_compensation_override = OPT_FOLLOWER_GRAVITY_COMPENSATION_DEFAULT;
+    ///< Per-joint torq_rescale override (from the devices.toml [arms] torq_rescale
+    ///< array). Empty when unset; otherwise one value per arm joint, applied after
+    ///< the model and individual configs (highest precedence).
+    std::vector<float> torq_rescale_override;
     float force_feedback;                 ///< Force feedback parameter.
     std::string topic_state;
     std::string topic_live_command;
@@ -138,6 +165,20 @@ class CommandLineArgs {
     std::string effector_model_config;
     std::string effector_instance_config;
     std::string urdf_path;
+    int parent_liveness_fd = -1;  ///< Inherited lifeline pipe; EOF means the Python owner exited.
+    std::string fr3_address;       ///< FR3 controller hostname or IP address.
+    std::string fr3_reset_pose;    ///< Seven comma-separated reset joint positions (rad).
+    std::string robotiq_transport; ///< Empty, "rtu", or "tcp".
+    std::string robotiq_endpoint;  ///< Serial device for RTU or hostname/address for TCP.
+    int robotiq_port = 502;        ///< Modbus TCP port.
+    int robotiq_baud_rate = 115200; ///< Modbus RTU baud rate.
+    int robotiq_slave_id = 9;      ///< Robotiq Modbus slave id.
+    int robotiq_poll_frequency = 50; ///< Gripper status polling frequency (Hz).
+    int robotiq_timeout_ms = 200;  ///< Modbus response timeout.
+    int robotiq_min_position_raw = 3; ///< Raw register value for fully open.
+    int robotiq_max_position_raw = 230; ///< Raw register value for fully closed.
+    float robotiq_default_speed = 1.0f; ///< Speed used by position-only public commands.
+    float robotiq_default_force = 1.0f; ///< Force used by position-only public commands.
 
     // Unified move-to-ready / emergency-recovery options. See macros above for descriptions.
     float move_to_ready_vel_rad_s_normal; ///< Healthy move-to-ready angular speed (rad/s).
@@ -151,6 +192,14 @@ class CommandLineArgs {
      * @param argv Argument values.
      */
     CommandLineArgs(int argc, char** argv);
+
+    /*!
+     * @brief Parses a comma-separated torq_rescale override list.
+     *
+     * @param csv Comma-separated floats, e.g. "0.8,0.8,0.8,1.5,1.5,1.5".
+     * @return One value per joint; empty when any token is not a nonnegative finite float.
+     */
+    static std::vector<float> parse_torq_rescale_csv(const std::string& csv);
 
     // Default constructor.
     CommandLineArgs() = default;

@@ -4,7 +4,9 @@
  */
 
 #pragma once
-#include "arm_controls_driver_arx.hpp"
+#include <optional>
+
+#include "arm_controls_driver_can_mit.hpp"
 #include "arm_controls_servo.hpp"
 
 /*!
@@ -71,6 +73,7 @@ class ServoDm : public Servo {
      * @brief Register addresses for DM servo configuration and control.
      */
     enum class RegAddr {
+        TIMEOUT       = 9,  ///< CAN communication-loss protection window (uint32, 50 us per count).
         CONTROL_MODE = 10, ///< Register address for setting/reading control mode.
     };
 
@@ -130,10 +133,20 @@ class ServoDm : public Servo {
     ReturnCode start_hardware() override;
 
     /*!
+     * @brief Age of the newest parsed CAN frame for this servo, from the
+     *        DriverCanMit receive cache (``last_update_perf_``). Note this is
+     *        bus liveness, not position freshness: some frame types (ENCOS
+     *        config acks, non-position ack statuses) refresh the stamp
+     *        without updating the cached position.
+     * @return Frame age in milliseconds, or -1 when no frame was ever parsed.
+     */
+    prof_time_msec_t get_frame_age_ms() override;
+
+    /*!
      * @brief Confirms that ``received_servo_data_`` for this servo has been
      *        populated by at least one parsed status frame. DM motors do not
      *        broadcast status spontaneously, so without a successful
-     *        ``DriverArx::enable()`` response parse the cache stays zero and
+     *        ``DriverCanMit::enable()`` response parse the cache stays zero and
      *        ``curr_pos_abs_`` would be a stale 0. The check looks at
      *        ``motor_id_`` which is zero only when the cache has never been
      *        touched (real DM IDs are 1+).
@@ -141,6 +154,18 @@ class ServoDm : public Servo {
      *         ReturnCode::FAIL otherwise.
      */
     ReturnCode verify_position_fresh() override;
+
+    /*!
+     * @brief Confirms the servo is in a healthy, enabled state right before
+     *        the control loop starts. A latched DM error (e.g. 0xD
+     *        communication loss left over from a previous session) silently
+     *        disables the motor while position feedback keeps flowing, so
+     *        the joint would collapse under gravity the moment commands
+     *        start. Attempts one re-enable for DM servos before failing.
+     * @return ReturnCode::SUCCESS if the servo reports a healthy state,
+     *         otherwise an error code.
+     */
+    ReturnCode verify_operational() override;
 
     /*!
      * @brief Moves the servo to the target position.
@@ -183,12 +208,12 @@ class ServoDm : public Servo {
      * @param p_frame Pointer to the received CAN frame.
      * @param p_received_servo_data Pointer to the buffer where parsed servo data will be stored.
      * @param p_find_data_index Function pointer to find the data buffer index for a given servo ID.
-     * @param p_driver_arx Pointer to the CAN driver object.
+     * @param p_driver_can_mit Pointer to the CAN driver object.
      * @return ReturnCode indicating success or failure.
      */
     static ReturnCode parse_dm_servo_status(DriverCan::can_frame_t* p_frame, ReceivedServoData* p_received_servo_data,
-                                            DriverArx::func_find_data_index_t p_find_data_index,
-                                            DriverArx* p_driver_arx);
+                                            DriverCanMit::func_find_data_index_t p_find_data_index,
+                                            DriverCanMit* p_driver_can_mit);
 
     /*!
      * @brief Parses an Encos servo status message from a CAN frame.
@@ -199,7 +224,7 @@ class ServoDm : public Servo {
      */
     static ReturnCode parser_encos_servo_status(DriverCan::can_frame_t* p_frame,
                                                 ReceivedServoData* p_received_servo_data,
-                                                DriverArx::func_find_data_index_t p_find_data_index);
+                                                DriverCanMit::func_find_data_index_t p_find_data_index);
 
     /*!
      * @brief Constructs a CAN command frame for DM servo control.
@@ -276,6 +301,96 @@ class ServoDm : public Servo {
     static ReturnCode can_frame_to_command_encos_servo(DriverCan::can_frame_t& can_frame, uint16_t motor_id, float kp,
                                                        float kd, float pos, float spd, float tor);
 
+    /*!
+     * @brief Constructs an ENCOS config-set frame that writes the CAN
+     *        communication-loss heartbeat window.
+     * @param can_frame Reference to the CAN frame structure to be filled.
+     * @param motor_id The CAN ID of the target motor.
+     * @param timeout_ms Heartbeat window in milliseconds (0 disables the protection).
+     * @return ReturnCode indicating success or failure.
+     */
+    static ReturnCode can_frame_to_set_can_timeout_encos_servo(DriverCan::can_frame_t& can_frame, uint16_t motor_id,
+                                                               uint16_t timeout_ms);
+
+    /*!
+     * @brief Constructs an ENCOS config-query frame for the current CAN
+     *        communication-loss heartbeat window.
+     * @param can_frame Reference to the CAN frame structure to be filled.
+     * @param motor_id The CAN ID of the target motor.
+     * @return ReturnCode indicating success or failure.
+     */
+    static ReturnCode can_frame_to_get_can_timeout_encos_servo(DriverCan::can_frame_t& can_frame, uint16_t motor_id);
+
+    /*!
+     * @brief Parses the ACK_QUERY reply to a CAN-timeout query.
+     * @param can_frame The received reply frame.
+     * @param motor_id Expected motor CAN ID.
+     * @param timeout_ms Out: current heartbeat window in milliseconds.
+     * @return ReturnCode::SUCCESS when the frame is a matching reply, FAIL otherwise.
+     */
+    static ReturnCode parse_can_timeout_reply_encos_servo(const DriverCan::can_frame_t& can_frame, uint16_t motor_id,
+                                                          uint16_t& timeout_ms);
+
+    // ENCOS MIT-protocol range queries (technical document 9.3 / reply type 5,
+    // 10.5). The wire codec ranges are per-motor firmware parameters, so the
+    // compiled defaults may not match a given motor (some motor batches ship
+    // with a wider TOR range than the EC-A4310-P2-36 factory default).
+    static constexpr uint8_t ENCOS_QUERY_SPD_RANGE = 26;  ///< Query code: MIT SPD range (int16 pair, scale 100).
+    static constexpr uint8_t ENCOS_QUERY_TOR_RANGE = 27;  ///< Query code: MIT TOR range (int16 pair, scale 10).
+    static constexpr float ENCOS_SPD_RANGE_SCALE = 0.01f;  ///< rad/s per raw count in a SPD-range reply.
+    static constexpr float ENCOS_TOR_RANGE_SCALE = 0.1f;   ///< Nm per raw count in a TOR-range reply.
+
+    /*!
+     * @brief Constructs an ENCOS config-query frame for an MIT-protocol range.
+     * @param can_frame Reference to the CAN frame structure to be filled.
+     * @param motor_id The CAN ID of the target motor.
+     * @param query_code ENCOS_QUERY_SPD_RANGE or ENCOS_QUERY_TOR_RANGE.
+     * @return ReturnCode indicating success or failure.
+     */
+    static ReturnCode can_frame_to_get_mit_range_encos_servo(DriverCan::can_frame_t& can_frame, uint16_t motor_id,
+                                                             uint8_t query_code);
+
+    /*!
+     * @brief Parses the ACK_QUERY reply to an MIT-range query (codes 26/27).
+     * @param can_frame The received reply frame.
+     * @param motor_id Expected motor CAN ID.
+     * @param query_code Expected query code echoed in the reply.
+     * @param scale Physical units per raw count (ENCOS_SPD_RANGE_SCALE / ENCOS_TOR_RANGE_SCALE).
+     * @param range_min Out: queried range minimum in physical units.
+     * @param range_max Out: queried range maximum in physical units.
+     * @return ReturnCode::SUCCESS when the frame is a matching reply, FAIL otherwise.
+     */
+    static ReturnCode parse_mit_range_reply_encos_servo(const DriverCan::can_frame_t& can_frame, uint16_t motor_id,
+                                                        uint8_t query_code, float scale, float& range_min,
+                                                        float& range_max);
+
+    /*!
+     * @brief Handles a motor-reported MIT codec range for this servo's encode/decode.
+     *
+     * SPD ranges are adopted: the compiled parameter set is copied into a
+     * per-servo override on first use so both the command builder and the
+     * status parser scale against the motor's actual firmware range.
+     *
+     * TOR ranges are verify-and-log only: the
+     * ENCOS codec uses +-42 Nm even when the firmware register reports +-30 Nm.
+     * Adopting the register would silently shift gravity feed-forward delivery.
+     * A mismatch is logged loudly and the compiled codec is kept.
+     *
+     * @param query_code ENCOS_QUERY_SPD_RANGE or ENCOS_QUERY_TOR_RANGE.
+     * @param range_min Queried range minimum in physical units.
+     * @param range_max Queried range maximum in physical units.
+     * @return ReturnCode::SUCCESS, or FAIL when the values are not a sane range.
+     */
+    ReturnCode adopt_encos_mit_range(uint8_t query_code, float range_min, float range_max);
+
+    /*!
+     * @brief MIT codec report: effective codec ranges plus the motor-reported firmware ranges.
+     *
+     * Lets clients (gravity_tune) compare the servo parameters of two arms before assuming
+     * one torq_rescale calibration fits both (ENCOS batches report different TOR registers).
+     */
+    bool get_mit_codec_report(MitCodecReport& report) const override;
+
    protected:
     /*!
      * @brief Initializes the current estimation system for the DM servo.
@@ -289,9 +404,20 @@ class ServoDm : public Servo {
                                             const char* trigger);
     ReturnCode reject_if_thermal_fault_latched() const;
 
-    DriverArx* p_driver_can_ = nullptr;  ///< Pointer to the CAN driver (cast from base Driver pointer).
+    DriverCanMit* p_driver_can_ = nullptr;  ///< Pointer to the CAN driver (cast from base Driver pointer).
     HoldChecker checker_motor_no_response_;  ///< Checker for detecting motor communication failures.
     bool motor_moved_ = false;  ///< Flag indicating whether the motor has moved from its initial position.
     uint8_t last_reported_fault_code_ = 0;  ///< Last DM fault logged, to avoid repeating it every control loop.
     bool thermal_fault_latched_ = false;  ///< Thermal effector fault: output was disabled and must not be re-enabled.
+    /// Per-servo codec parameter override, populated when an ENCOS MIT-range
+    /// query reports a range that must replace the compiled default.
+    std::optional<ServoDmParam> encos_param_override_;
+    /// Motor-reported MIT firmware ranges (ENCOS range query), kept verbatim for the
+    /// client servo-parameter report even when the compiled codec is retained.
+    bool reported_spd_range_valid_ = false;
+    float reported_spd_min_ = 0.0f;  ///< Motor-reported SPD range minimum (rad/s).
+    float reported_spd_max_ = 0.0f;  ///< Motor-reported SPD range maximum (rad/s).
+    bool reported_tor_range_valid_ = false;
+    float reported_tor_min_ = 0.0f;  ///< Motor-reported TOR range minimum (Nm).
+    float reported_tor_max_ = 0.0f;  ///< Motor-reported TOR range maximum (Nm).
 };

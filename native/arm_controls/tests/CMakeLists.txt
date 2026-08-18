@@ -36,6 +36,8 @@ add_executable(arm_controls_tests
   test_posix_syscall_hooks.cpp
   test_servo_dm_status.cpp
   test_driver_base.cpp
+  test_fr3_controller.cpp
+  test_robotiq.cpp
   ${ARM_CONTROLS_ROOT}/src/can/math_ops.cpp
   ${ARM_CONTROLS_ROOT}/src/arm_controls_filter.cpp
   ${ARM_CONTROLS_ROOT}/src/arm_controls_stall_detect.cpp
@@ -45,6 +47,7 @@ add_executable(arm_controls_tests
   ${ARM_CONTROLS_ROOT}/src/arm_controls_driver_can.cpp
   ${ARM_CONTROLS_ROOT}/src/arm_controls_servo_dm_status.cpp
   ${ARM_CONTROLS_ROOT}/src/arm_controls_info.cpp
+  ${ARM_CONTROLS_ROOT}/src/arm_controls_fr3_controller.cpp
 )
 target_include_directories(arm_controls_tests PRIVATE ${ARM_CONTROLS_ROOT}/include)
 target_compile_features(arm_controls_tests PRIVATE cxx_std_17)

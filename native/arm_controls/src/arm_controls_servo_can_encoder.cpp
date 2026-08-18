@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "arm_controls_joint.hpp"
+#include "arm_controls_profile.hpp"
 #include "arm_controls_servo_can_encoder.hpp"
 
 // Trigger displacement per encoder tick.
@@ -48,7 +49,7 @@ static const ServoParam g_servo_can_passive_encoder_param(DEFAULT_TOLERABLE_POS_
 
 ServoCanPassiveEncoder::ServoCanPassiveEncoder(Device* p_device, Joint* p_joint, Driver* p_driver)
     : Servo(p_device, p_joint, p_driver) {
-    p_driver_can_ = dynamic_cast<DriverArx*>(p_driver);
+    p_driver_can_ = dynamic_cast<DriverCanMit*>(p_driver);
 }
 
 ServoCanPassiveEncoder::~ServoCanPassiveEncoder() {}
@@ -95,13 +96,26 @@ ReturnCode ServoCanPassiveEncoder::init_config_model(const json& servo_config, c
         }
     }
 
-    return_code = p_driver_can_->register_passive_encoder(response_can_id_, id_, data_index_);
+    // Optional (default false): tolerate multiple teaching-handle firmware
+    // revisions during EEPROM/frequency setup. Only the YAM handle carries this
+    // passive encoder, so the compat path stays isolated from ARX arms.
+    bool firmware_compat = false;
+    if (servo_config.contains(p_config->fn_passive_encoder_firmware_compat)) {
+        return_code =
+            p_config->get_field_value(servo_config, p_config->fn_passive_encoder_firmware_compat, firmware_compat);
+        if (return_code != ReturnCode::SUCCESS) {
+            return return_code;
+        }
+    }
+
+    return_code = p_driver_can_->register_passive_encoder(response_can_id_, id_, data_index_, firmware_compat);
     if (return_code != ReturnCode::SUCCESS) {
         return return_code;
     }
 
     ARM_CONTROLS_INFO("Servo", InfoLevel::HELPFUL_1,
-            "Passive encoder ID %d: response_can_id=0x%02X button_num=%d", id_, response_can_id_, button_num_);
+            "Passive encoder ID %d: response_can_id=0x%02X button_num=%d firmware_compat=%d", id_, response_can_id_,
+            button_num_, firmware_compat ? 1 : 0);
 
     return ReturnCode::SUCCESS;
 }
@@ -125,7 +139,7 @@ ReturnCode ServoCanPassiveEncoder::start_hardware() {
     }
 
     // Presence probe using the same single-outstanding/deadline/backoff rules
-    // as normal reads. DriverArx has already validated the encoder before
+    // as normal reads. DriverCanMit has already validated the encoder before
     // motor enable; this proves that report polling also works after reception
     // starts.
     const auto startup_deadline = Clock::now() + PASSIVE_ENCODER_START_TIMEOUT;
@@ -314,7 +328,7 @@ ReturnCode ServoCanPassiveEncoder::parse_encoder_status(const DriverCan::can_fra
     // Big-endian payload: device_id (u8), position (i16, ticks),
     // velocity (i16, ticks/s), digital_inputs (u8). The device_id byte is NOT
     // validated: YAM handle firmware reports 0 there regardless of the CAN id
-    // (observed on hardware; the byte is not stable), so
+    // (observed on hardware; firmware variants do not agree on the byte), so
     // routing trusts the registered response CAN id alone.
     const uint8_t* p_data = frame.data;
     const int16_t position_ticks = static_cast<int16_t>((p_data[1] << 8) | p_data[2]);
@@ -328,6 +342,9 @@ ReturnCode ServoCanPassiveEncoder::parse_encoder_status(const DriverCan::can_fra
     slot.temperature_ = 0;
     slot.digital_inputs_ = p_data[5];
     slot.update_count_++;
+    // Stamp bus liveness for the staleness watchdog
+    // (DriverCanMit::group_read_hardware_values / ServoDm::read_hardware_values).
+    slot.last_update_perf_ = Profile::get_time_now();
 
     return ReturnCode::SUCCESS;
 }

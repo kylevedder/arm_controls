@@ -188,15 +188,27 @@ ReturnCode Joint::init_config_model(const json& joint_config, const DeviceConfig
         ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: safe_mode_derating=%.3f", id_, safe_mode_derating_);
     }
 
+    // Load spring invert flag (optional: config format 1.1.1+ places it in the model
+    // configuration; the individual configuration may still override it)
+    return_code = p_config->get_field_value(joint_config, p_config->fn_joint_spring_invert, spring_invert_);
+    if (return_code == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: spring_invert=%d (from model config)", id_, spring_invert_);
+    }
+
     return ReturnCode::SUCCESS;
 }
 
 ReturnCode Joint::init_config_individual(const json& joint_config, const DeviceConfig* p_config) {
     ReturnCode return_code;
 
-    return_code = p_config->get_field_value(joint_config, p_config->fn_joint_spring_invert, spring_invert_);
+    bool spring_invert_individual = spring_invert_;
+    return_code = p_config->get_field_value(joint_config, p_config->fn_joint_spring_invert, spring_invert_individual);
     if (return_code == ReturnCode::SUCCESS) {
-        ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: spring_invert=%d", id_, spring_invert_);
+        if (spring_invert_individual != spring_invert_) {
+            ARM_CONTROLS_INFO("Joint", InfoLevel::ESSENTIAL_0, "Joint %d: spring_invert overridden by individual config: %d -> %d",
+                    id_, spring_invert_, spring_invert_individual);
+        }
+        spring_invert_ = spring_invert_individual;
     }
 
     return_code =
@@ -208,6 +220,53 @@ ReturnCode Joint::init_config_individual(const json& joint_config, const DeviceC
         ARM_CONTROLS_ERROR("Joint %d reference_servo_index=%d is out of range for %d servos", id_, reference_servo_index_,
                  (int)servos_.size());
         return ReturnCode::INVALID_PARAM;
+    }
+
+    // Optional per-instance motion-limit overrides. The individual config
+    // (effector_instance_config) may raise/lower the joint's velocity and
+    // acceleration limits without a separate effector model.
+    if (p_config->get_field_value(joint_config, p_config->fn_joint_vel_max, vel_max_) == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: vel_max override=%.3f", id_, vel_max_);
+    }
+    if (p_config->get_field_value(joint_config, p_config->fn_joint_accel_max, accel_max_) == ReturnCode::SUCCESS) {
+        ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: accel_max override=%.3f", id_, accel_max_);
+    }
+    if (p_config->get_field_value(joint_config, p_config->fn_joint_follow_vel_max, follow_vel_max_) ==
+        ReturnCode::SUCCESS) {
+        follow_vel_max_configured_ = true;
+        ARM_CONTROLS_INFO("Joint", InfoLevel::HELPFUL_1, "Joint %d: follow_vel_max override=%.3f", id_, follow_vel_max_);
+    } else if (!follow_vel_max_configured_) {
+        // follow_vel_max was never set explicitly; keep it tracking the
+        // (possibly overridden) vel_max.
+        follow_vel_max_ = vel_max_;
+    }
+
+    if (!std::isfinite(vel_max_) || vel_max_ <= 0.0f || !std::isfinite(accel_max_) || accel_max_ <= 0.0f ||
+        !std::isfinite(follow_vel_max_) || follow_vel_max_ <= 0.0f) {
+        ARM_CONTROLS_ERROR("Joint %d: vel_max/accel_max/follow_vel_max must be finite and positive after individual "
+                 "overrides (vel_max=%.3f accel_max=%.3f follow_vel_max=%.3f)",
+                 id_, vel_max_, accel_max_, follow_vel_max_);
+        return ReturnCode::INVALID_PARAM;
+    }
+
+    // Optional gravity-delivery calibration override: torq_rescale is a
+    // per-unit value (motor batches differ in effective torque full scale, so
+    // the kp=0 float test calibrates each robot), and a site calibration JSON
+    // may replace the model default without a wheel rebuild.
+    float torq_rescale_individual = torq_rescale_;
+    if (p_config->get_field_value(joint_config, p_config->fn_joint_torq_rescale, torq_rescale_individual) ==
+        ReturnCode::SUCCESS) {
+        if (!std::isfinite(torq_rescale_individual) || torq_rescale_individual < 0.0f) {
+            ARM_CONTROLS_ERROR("Joint %d: torq_rescale override must be finite and nonnegative, but found %.3f", id_,
+                     torq_rescale_individual);
+            return ReturnCode::INVALID_PARAM;
+        }
+        if (torq_rescale_individual != torq_rescale_) {
+            ARM_CONTROLS_INFO("Joint", InfoLevel::ESSENTIAL_0,
+                    "Joint %d: torq_rescale overridden by individual config: %.3f -> %.3f", id_, torq_rescale_,
+                    torq_rescale_individual);
+        }
+        torq_rescale_ = torq_rescale_individual;
     }
 
     return ReturnCode::SUCCESS;
@@ -557,6 +616,16 @@ ReturnCode Joint::verify_position_fresh() {
         return ReturnCode::NOT_INITIALIZED;
     }
     return servos_[reference_servo_index_]->verify_position_fresh();
+}
+
+ReturnCode Joint::verify_operational() {
+    for (auto& p_servo : servos_) {
+        ReturnCode return_code = p_servo->verify_operational();
+        if (return_code != ReturnCode::SUCCESS) {
+            return return_code;
+        }
+    }
+    return ReturnCode::SUCCESS;
 }
 
 ReturnCode Joint::hold_at_current_position() {

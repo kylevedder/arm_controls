@@ -3,10 +3,16 @@
 from .arms import FollowerArm, LeaderArm
 from .config import (
     ArmConfig,
+    EthernetConnection,
+    FR3Connection,
     InputLayout,
     ResolvedArmAssets,
+    RobotiqConnection,
+    RobotiqTransport,
     SafetyLimits,
+    SerialConnection,
     SocketCanConnection,
+    connection_for_interface,
     resolve_model_assets,
 )
 from .exceptions import (
@@ -31,6 +37,7 @@ from .types import (
     ArmState,
     EffectorState,
     InputState,
+    JointServoReport,
     JointState,
     PositionCommand,
 )
@@ -48,10 +55,13 @@ __all__ = [
     "ConfigurationError",
     "ConnectionUnavailableError",
     "EffectorState",
+    "EthernetConnection",
+    "FR3Connection",
     "FollowerArm",
     "HardwareFaultError",
     "InputLayout",
     "InputState",
+    "JointServoReport",
     "JointState",
     "LeaderArm",
     "NativeProcessError",
@@ -60,9 +70,13 @@ __all__ = [
     "RoleError",
     "SafetyLimits",
     "ResolvedArmAssets",
+    "RobotiqConnection",
+    "RobotiqTransport",
+    "SerialConnection",
     "SocketCanConnection",
     "StaleStateError",
     "StateTimeoutError",
     "TeleopPair",
+    "connection_for_interface",
     "resolve_model_assets",
 ]

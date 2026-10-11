@@ -50,7 +50,7 @@ There is no joystick and no actively driven gripper on the leader.
   (0.7 rad) and map `|position| / range_rad` to `[0, 1]`. The downstream consumer
   then inverts (`1.0 - position`) to make the value open-positive, and divides
   by a per-handle `trigger_closed_position` calibration scalar before
-  clipping. In `arm_controls` both live natively: the inversion is `open_at_min` on the
+  clipping. In arm_controls both live natively: the inversion is `open_at_min` on the
   effector model, and the travel saturation is the instance config's
   `pos_max` — physical triggers only reach ~0.9 of the encoder's 0.7 rad
   range, so `E_Yam_Handle_01.json` ships `pos_max: 0.63` (= 0.9 × 0.7) and a

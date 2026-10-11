@@ -3,6 +3,7 @@
  * @brief Base class for robotic arm devices.
  */
 #pragma once
+#include <chrono>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -74,6 +75,18 @@ class DeviceArm : public Device {
     ReturnCode start(int baud_rate) override;
 
     /*!
+     * @brief Final pre-loop servo error-state check. Probes every joint by
+     *        re-sending its last commanded target so DM servos (which never
+     *        broadcast spontaneously) answer with fresh status frames, waits
+     *        ``VERIFY_SERVOS_PROBE_WAIT_US`` for the asynchronous parse of
+     *        those responses, then runs the per-joint ``verify_operational()``
+     *        check (which attempts one re-enable for a latched DM error).
+     *        Delegates to the effector afterwards.
+     * @return ReturnCode::SUCCESS when every servo is operational.
+     */
+    ReturnCode verify_servos_operational() override;
+
+    /*!
      * @brief Performs a single step in the control loop.
      */
     ReturnCode step() override;
@@ -130,6 +143,35 @@ class DeviceArm : public Device {
     ReturnCode set_runtime_force_feedback_gain(float gain) override;
 
     /*!
+     * @brief Follower calibration gravity float (gravity_tune / arm_check float runs).
+     *
+     * Enable: the arm joints switch to leader control mode (no position PD) and
+     * operate_as_follower() applies the model gravity feed-forward alone, matching the
+     * leader's disengaged float. The float-entry pose is captured as the runaway
+     * baseline; the control loop re-engages HOLD itself the moment any joint drifts
+     * beyond ``abort_drift_rad``. Disable (also via runtime_hold() or any move-to-ready
+     * path) re-engages follower position control at the current pose.
+     */
+    ReturnCode set_runtime_gravity_float(bool enabled, float abort_drift_rad) override;
+
+    /*!
+     * @brief Runtime per-joint torq_rescale update (calibration tools; no node restart).
+     */
+    ReturnCode set_runtime_torq_rescale(const std::vector<float>& values) override;
+
+    /*!
+     * @brief Publishes the next joint's DEVICE_INFO_SERVO_PARAM message (round-robin).
+     *
+     * Carries the effective MIT codec ranges and the motor-reported firmware ranges so
+     * clients (gravity_tune) can compare two arms' servo parameters before assuming one
+     * torq_rescale calibration fits both. One joint per call: the status sockets run
+     * with a tiny HWM, so a per-joint burst would be dropped down to its tail.
+     */
+    ReturnCode publish_next_servo_param() override;
+
+    ReturnCode runtime_hold() override;
+
+    /*!
      * @brief UI-facing progress estimate for any active move-to-ready.
      *
      * Captures each non-failed joint's initial |home - current| at first call (or after
@@ -151,6 +193,17 @@ class DeviceArm : public Device {
         enabled_gravity_compensation_ = enable;
         return ReturnCode::SUCCESS;
     }
+
+    /*!
+     * @brief Whether this arm's joints accept a torque feed-forward with position commands.
+     *
+     * Gravity feed-forward streamed from this node requires it. DeviceArm::init
+     * fast-fails a --follower_gravity_compensation request on serial arms
+     * (position-only bus); controller arms are accepted without torque streaming
+     * because the vendor controller applies its own compensation.
+     * @return True only for MIT-mode CAN arms.
+     */
+    virtual bool supports_torque_feed_forward() const { return false; }
 
    protected:
     /*!
@@ -193,10 +246,21 @@ class DeviceArm : public Device {
      */
     void reset_slew_targets_to_current();
 
+    /*!
+     * @brief Recomputes follower gravity feed-forward and viscous damping torques.
+     *
+     * Used by both normal follower tracking and move-to-ready so switching into
+     * the ready trajectory does not abruptly replace gravity-supported position
+     * commands with zero-torque position commands.
+     */
+    ReturnCode update_follower_feedforward_torques();
+
     std::vector<float> tele_pos_;  ///< Teleoperation target positions (relative radians).
     std::vector<float> tele_vel_;  ///< Teleoperation target velocities (rad/s).
     std::vector<float> tele_tor_;  ///< Teleoperation target torques (Nm).
     std::vector<float> max_vel_;   ///< Maximum velocity limits (rad/s).
+
+    int servo_param_publish_index_ = 0;  ///< Round-robin cursor of publish_next_servo_param().
 
     std::vector<float> follower_pos_;         ///< Follower target positions (relative radians).
     std::vector<float> follower_vel_;         ///< Follower target velocities (rad/s).
@@ -212,6 +276,7 @@ class DeviceArm : public Device {
     std::vector<float> target_tor_;              ///< Pre-allocated target torque vector.
     std::vector<float> current_motor_positions_;  ///< Pre-allocated current motor positions vector.
     std::vector<float> slew_goal_positions_;      ///< Safe follower goals used to compute one synchronized slew scale.
+    std::chrono::steady_clock::time_point follower_slew_last_time_{};  ///< Previous follower slew update time.
 
     std::vector<int16_t>       joint_init_sequence_;      ///< Sequence of joint IDs for initialization.
     int16_t                    moving_joint_index_ = 0;   ///< Index of currently moving joint.

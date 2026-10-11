@@ -13,7 +13,7 @@
 #pragma once
 #include <chrono>
 
-#include "arm_controls_driver_arx.hpp"
+#include "arm_controls_driver_can_mit.hpp"
 #include "arm_controls_servo.hpp"
 
 #define PASSIVE_ENCODER_RESPONSE_LEN 6      ///< Response payload: device_id (u8) + position (i16) + velocity (i16) + digital_inputs (u8), big-endian.
@@ -129,7 +129,7 @@ class ServoCanPassiveEncoder : public Servo {
 
     using Clock = std::chrono::steady_clock;
 
-    DriverArx* p_driver_can_ = nullptr;      ///< Pointer to the CAN driver (cast from base Driver pointer).
+    DriverCanMit* p_driver_can_ = nullptr;      ///< Pointer to the CAN driver (cast from base Driver pointer).
     int response_can_id_ = -1;               ///< CAN id the encoder answers on (default id + 1).
     int button_num_ = 2;                     ///< Number of buttons carried in the digital-inputs byte.
     uint32_t last_update_count_ = 0;         ///< Cache update counter at the previous read.

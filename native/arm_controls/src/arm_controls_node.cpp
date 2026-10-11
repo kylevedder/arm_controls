@@ -4,12 +4,17 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <boost/program_options.hpp>
+#include <cerrno>
 #include <csignal>
 #include <iostream>
 #include <memory>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "arm_controls_command_line_args.hpp"
@@ -25,17 +30,98 @@ void arm_controls_signal_handler(int signum) {
     g_terminate_signal_received = signum;
 }
 
+namespace {
+
+class ParentLivenessMonitor {
+   public:
+    ParentLivenessMonitor() = default;
+    ParentLivenessMonitor(const ParentLivenessMonitor&) = delete;
+    ParentLivenessMonitor& operator=(const ParentLivenessMonitor&) = delete;
+
+    ~ParentLivenessMonitor() { stop(); }
+
+    void start(int fd) {
+        if (fd < 0) {
+            return;
+        }
+        fd_ = fd;
+        thread_ = std::thread([this] { monitor(); });
+    }
+
+    void stop() {
+        stop_requested_.store(true);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+
+   private:
+    void request_graceful_shutdown() const {
+        if (!stop_requested_.load()) {
+            // Deliver the same signal as Popen.terminate(). The existing
+            // handler leaves device teardown on the main control thread.
+            (void)kill(getpid(), SIGTERM);
+        }
+    }
+
+    void monitor() {
+        pollfd descriptor{fd_, POLLIN, 0};
+        while (!stop_requested_.load()) {
+            descriptor.revents = 0;
+            const int result = poll(&descriptor, 1, 100);
+            if (result == 0) {
+                continue;
+            }
+            if (result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                request_graceful_shutdown();
+                return;
+            }
+            if ((descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                request_graceful_shutdown();
+                return;
+            }
+            if ((descriptor.revents & POLLIN) != 0) {
+                char byte = 0;
+                const ssize_t bytes_read = read(fd_, &byte, sizeof(byte));
+                if (bytes_read == 0 || (bytes_read < 0 && errno != EINTR)) {
+                    request_graceful_shutdown();
+                    return;
+                }
+            }
+        }
+    }
+
+    int fd_ = -1;
+    std::atomic<bool> stop_requested_{false};
+    std::thread thread_;
+};
+
+}  // namespace
+
 int main(int argc, char** argv) {
     std::signal(SIGINT, arm_controls_signal_handler);
     std::signal(SIGHUP, arm_controls_signal_handler);
     std::signal(SIGTERM, arm_controls_signal_handler);
+    // Python owns the read end of stdout. If it exits abruptly, logging during
+    // parent-death cleanup must see EPIPE instead of terminating the node before
+    // p_device->stop() runs.
+    std::signal(SIGPIPE, SIG_IGN);
 
     // Own the device instance for the entire scope of main (including catch
     // blocks).
     std::unique_ptr<Device> p_device;
+    ParentLivenessMonitor parent_liveness_monitor;
 
     try {
         CommandLineArgs cla(argc, argv);
+        parent_liveness_monitor.start(cla.parent_liveness_fd);
 
         g_info_manager.set_info_level((InfoLevel)cla.info_level);
         g_info_manager.add_groups(cla.info_groups, ',');
@@ -80,7 +166,7 @@ int main(int argc, char** argv) {
 
         ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0, "Starting devices...");
 
-        return_code = p_device->start(0);
+        return_code = p_device->start(cla.baud_rate);
         if (return_code != ReturnCode::SUCCESS) {
             // Communication failures should not keep the process running for
             // long.
@@ -88,9 +174,44 @@ int main(int argc, char** argv) {
             return -1;
         }
 
+        // Final servo error-state check after the whole start() sequence. The
+        // in-start() verification can pass and a servo can still latch a
+        // communication-loss error afterwards (e.g. a stale RAM protection
+        // window expiring while a slow sibling servo was enabling). A latched
+        // DM servo keeps reporting positions but produces no torque, so
+        // without this check the joint would silently collapse under gravity
+        // once commands stream. verify_servos_operational() probes for fresh
+        // status frames, attempts one re-enable per latched DM servo, and
+        // fails the startup if a servo stays in an error state. Must run
+        // BEFORE arm_comm_loss_protection(): the recovery re-enable disarms
+        // the DM TIMEOUT register, so arming has to stay the last step.
+        return_code = p_device->verify_servos_operational();
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("Pre-loop servo verification failed: error code=%d", return_code);
+            return -1;
+        }
+
+        // Assert the servo communication-loss policy only now, when every
+        // servo is enabled and verified and the command stream starts within
+        // milliseconds. The window is per-device (wants_comm_loss_stop()):
+        // armed for velocity/torque-commanded servos (stop a runaway), and
+        // disarmed for position-commanded servos (keep holding the last
+        // position instead of collapsing detorqued). Failures are loud but
+        // non-fatal: the servos stay controllable, just with an unasserted
+        // policy.
+        return_code = p_device->arm_comm_loss_protection();
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("Failed to arm communication-loss protection: error code=%d", return_code);
+        }
+
         int capability_flags = ARM_CONTROLS_CAP_MOVE_TO_READY;
         if (cla.role == Role::FOLLOWER) {
             capability_flags |= ARM_CONTROLS_CAP_DIRECT_COMMAND | ARM_CONTROLS_CAP_LIVE_INPUT;
+        } else if (p_device->is_read_only()) {
+            // Read-only leader (passive encoders, e.g. ARX_ENC): cannot produce torque,
+            // so gravity compensation and force feedback are not available. The arm
+            // still streams joint positions as a leader, and move-to-ready remains a
+            // harmless no-op (the device marks itself ready immediately).
         } else {
             capability_flags |= ARM_CONTROLS_CAP_GRAVITY_COMP | ARM_CONTROLS_CAP_FORCE_FEEDBACK;
         }
@@ -113,6 +234,7 @@ int main(int argc, char** argv) {
         const int ready_announce_interval_loops =
             std::max(1, (int)cla.control_frequency / 10);  // ~0.1 sec
         int handshake_announce_counter = 0;
+        int servo_param_announce_counter = 0;
 
         while (g_terminate_signal_received == 0 && p_device->is_running()) {
             return_code = p_device->step();
@@ -179,6 +301,15 @@ int main(int argc, char** argv) {
 
             if ((handshake_announce_counter++ % std::max(1, cla.control_frequency / 2)) == 0) {
                 p_device->publish_device_info(DEVICE_INFO_PROTOCOL_HANDSHAKE, nullptr, &handshake_data);
+            }
+
+            // Servo parameters: one joint per publish on a faster cadence (10 Hz),
+            // round-robin. Pub/sub gives no replay, so the report repeats forever for
+            // late subscribers — and the status sockets run with a tiny HWM (2), so a
+            // per-joint burst would be dropped down to its tail (observed: the client
+            // received 1 of 6 joints when all were published in one tick).
+            if ((servo_param_announce_counter++ % std::max(1, cla.control_frequency / 10)) == 0) {
+                p_device->publish_next_servo_param();
             }
 
             const bool ready_now = p_device->is_ready();
@@ -256,8 +387,8 @@ int main(int argc, char** argv) {
         }
         ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0, "Device stopped");
 
-    } catch (const ArmControlsException& e) {
-        std::cerr << "Caught ArmControlsException: " << e.what() << std::endl;
+    } catch (const PiException& e) {
+        std::cerr << "Caught PiException: " << e.what() << std::endl;
 
         ///< @todo Disabled throwing exception in ARM_CONTROLS_ERROR() to avoid abrupt
         ///< program termination

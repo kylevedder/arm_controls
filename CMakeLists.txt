@@ -21,6 +21,12 @@ set(ARM_CONTROLS_PINOCCHIO_PREFIX "${ARM_CONTROLS_DEPS_DIR}/pinocchio/install" C
     "Pinocchio installation prefix used by arm_controls")
 set(ARM_CONTROLS_CPPZMQ_PREFIX "${ARM_CONTROLS_DEPS_DIR}/cppzmq/install" CACHE PATH
     "cppzmq installation prefix used by arm_controls")
+set(ARM_CONTROLS_TROSSEN_PREFIX "${ARM_CONTROLS_DEPS_DIR}/trossen_arm/install" CACHE PATH
+    "libtrossen_arm installation prefix used by arm_controls")
+set(ARM_CONTROLS_LIBFRANKA_PREFIX "${ARM_CONTROLS_DEPS_DIR}/libfranka/install" CACHE PATH
+    "libfranka installation prefix used by arm_controls")
+set(ARM_CONTROLS_LIBMODBUS_PREFIX "${ARM_CONTROLS_DEPS_DIR}/libmodbus/install" CACHE PATH
+    "libmodbus installation prefix used by arm_controls")
 
 if(EXISTS "${ARM_CONTROLS_PINOCCHIO_PREFIX}/lib/pkgconfig/pinocchio.pc")
   list(PREPEND CMAKE_PREFIX_PATH "${ARM_CONTROLS_PINOCCHIO_PREFIX}")
@@ -35,6 +41,14 @@ endif()
 if(EXISTS "${ARM_CONTROLS_CPPZMQ_PREFIX}/include/zmq.hpp")
   list(PREPEND CMAKE_PREFIX_PATH "${ARM_CONTROLS_CPPZMQ_PREFIX}")
   set(ARM_CONTROLS_CPPZMQ_INCLUDE_DIR "${ARM_CONTROLS_CPPZMQ_PREFIX}/include")
+endif()
+
+if(EXISTS "${ARM_CONTROLS_TROSSEN_PREFIX}/lib/libtrossen_arm.a")
+  list(PREPEND CMAKE_PREFIX_PATH "${ARM_CONTROLS_TROSSEN_PREFIX}")
+endif()
+
+if(EXISTS "${ARM_CONTROLS_LIBFRANKA_PREFIX}/lib/libfranka.a")
+  list(PREPEND CMAKE_PREFIX_PATH "${ARM_CONTROLS_LIBFRANKA_PREFIX}")
 endif()
 
 # Sanitizer plumbing for the test targets. Valid values: "" (off), "address,undefined",

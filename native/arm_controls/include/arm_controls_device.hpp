@@ -203,6 +203,50 @@ class Device {
     virtual ReturnCode start(int baud_rate);
 
     /*!
+     * @brief Final servo error-state check after the whole start() sequence,
+     *        right before the control loop begins. The in-start()
+     *        verification can pass and a servo can still latch a
+     *        communication-loss error afterwards (e.g. a stale RAM
+     *        protection window expiring while a slow sibling servo was
+     *        enabling). Concrete devices probe for fresh status frames and
+     *        run the per-joint ``verify_operational()`` check (which
+     *        attempts one re-enable for DM servos) so a silently disabled
+     *        motor is caught before commands stream. Default: nothing to
+     *        verify.
+     * @return ReturnCode::SUCCESS when every servo is operational,
+     *         otherwise an error code.
+     */
+    virtual ReturnCode verify_servos_operational() { return ReturnCode::SUCCESS; }
+
+    /*!
+     * @brief Asserts the servo-side communication-loss policy for every
+     *        servo of this device (delegates to
+     *        ``Driver::arm_comm_loss_protection()``). Must be called once,
+     *        after ``verify_servos_operational()`` and immediately before
+     *        the command stream starts.
+     * @return ReturnCode::SUCCESS if successful, otherwise an error code.
+     */
+    ReturnCode arm_comm_loss_protection();
+
+    /*!
+     * @brief Policy for the servo-side communication-loss window: whether a
+     *        servo of this device must hard-stop (auto-disable) when command
+     *        frames stop arriving. A stale velocity/torque command is a
+     *        runaway -> stop; a stale position command is the hold pose ->
+     *        keep holding instead of collapsing detorqued. Followers are
+     *        position-commanded, leaders are torque-commanded (gravity
+     *        compensation), hence the role-based default.
+     *
+     * Followers stay disarmed even with gravity feed-forward enabled: the
+     * frozen command (pos, kp>0, kd>0, gravity torque for that pose) is a
+     * stable position-anchored equilibrium, not a runaway, while arming would
+     * detorque the arm into an undamped free fall. The reference controller
+     * ships the same policy (ENCOS timeout 0 with follower gravity feed-forward).
+     * @return True when the protection window must be armed.
+     */
+    virtual bool wants_comm_loss_stop() { return role_ != Role::FOLLOWER; }
+
+    /*!
      * @brief Performs a single step in the device's control loop.
      * @return ReturnCode::SUCCESS if successful, otherwise an error code.
      */
@@ -229,6 +273,16 @@ class Device {
      */
     virtual ReturnCode publish_device_info(int info_key, std::vector<float>* p_float_data = nullptr,
                                            std::vector<int>* p_int_data = nullptr);
+
+    /*!
+     * @brief Publishes ONE joint's servo parameter report (DEVICE_INFO_SERVO_PARAM).
+     *
+     * Called on its own cadence by the node loop and rotates through the joints —
+     * one message per call, never a burst: the status sockets run with a tiny HWM
+     * (2), so publishing all joints at once would drop everything but the tail.
+     * Devices without MIT-codec servos publish nothing (default no-op).
+     */
+    virtual ReturnCode publish_next_servo_param() { return ReturnCode::SUCCESS; }
 
     /*!
      * @brief Requests a \"move-to-ready\" re-entry from the current pose.
@@ -366,9 +420,21 @@ class Device {
     float ready_move_step_rad() const {
         const float vel = is_slow_move_active() ? cla_.move_to_ready_vel_rad_s_error
                                                 : cla_.move_to_ready_vel_rad_s_normal;
+        return ready_move_step_rad(vel);
+    }
+
+    /*!
+     * @brief Converts a device-specific ready velocity to a per-loop position step.
+     *
+     * Arm joints use the command-line ready velocities above. Effectors have a
+     * much larger angular travel and call this overload with their own bounded
+     * velocity; sharing the arm's 0.3 rad/s rate made a 4.5-5.4 rad gripper
+     * stroke take 15-18 seconds.
+     */
+    float ready_move_step_rad(float velocity_rad_s) const {
         const float freq = static_cast<float>(cla_.control_frequency);
         const float dt = (freq > 0.0f) ? (1.0f / freq) : (1.0f / 50.0f);  // fallback to 50 Hz if cla unset
-        return vel * dt;
+        return velocity_rad_s * dt;
     }
 
     /*!
@@ -582,6 +648,41 @@ class Device {
 
     virtual ReturnCode set_runtime_force_feedback_gain(float gain);
 
+    /// Default runaway threshold of the calibration gravity float: the control loop
+    /// re-engages HOLD the moment any joint drifts this far from the float-entry pose.
+    static constexpr float kGravityFloatAbortRadDefault = 0.25f;
+
+    /*!
+     * @brief Toggles the follower calibration gravity float (gravity_tune / arm_check).
+     *
+     * When enabled, the arm joints drop to the gravity feed-forward alone (no position PD),
+     * matching the leader's disengaged float. The control loop watches the drift from the
+     * float-entry pose and re-engages HOLD itself the moment any joint exceeds
+     * ``abort_drift_rad`` — the client is too slow for this judgment (ZMQ round trip),
+     * so the runaway stop must live in the loop. HOLD or any move-to-ready path also
+     * re-engages position control. Only arm followers support this.
+     *
+     * @param enabled Enter (true) or leave (false) the float.
+     * @param abort_drift_rad Runaway threshold in radians; ignored when disabling.
+     */
+    virtual ReturnCode set_runtime_gravity_float(bool enabled, float abort_drift_rad) {
+        (void)enabled;
+        (void)abort_drift_rad;
+        return ReturnCode::NOT_SUPPORTED;
+    }
+
+    /*!
+     * @brief Updates the per-joint torq_rescale at runtime (calibration tools).
+     *
+     * Lets gravity_tune try a new gravity-delivery candidate instantly, without a node
+     * restart, so the arm never waits unpowered between candidates. One value per arm
+     * joint; the count must match the arm DOF.
+     */
+    virtual ReturnCode set_runtime_torq_rescale(const std::vector<float>& values) {
+        (void)values;
+        return ReturnCode::NOT_SUPPORTED;
+    }
+
     virtual ReturnCode runtime_hold();
 
     /*!
@@ -712,6 +813,22 @@ class Device {
 
     MovingMode moving_mode_ = MovingMode::INVALID;  ///< Strategy for moving joints (SEQUENTIAL or PARALLEL).
     TrajectoryPlanningType planning_type_;  ///< Trajectory planning type.
+
+    /// Follower gravity feed-forward: when set (DeviceArm::init, follower role
+    /// with the individual config's follower_gravity_compensation field, or the
+    /// --follower_gravity_compensation true/false override from devices.toml),
+    /// move() forwards the caller's gravity torque with every position command.
+    /// Independent of the planning type; never set on effectors or leaders.
+    bool follower_gravity_compensation_ = false;
+
+    /// Follower calibration gravity float (set_runtime_gravity_float): while true,
+    /// the arm joints run the leader-style gravity feed-forward alone instead of
+    /// position tracking. Cleared by HOLD, by every move-to-ready path, and by the
+    /// in-loop runaway watchdog (drift from gravity_float_baseline_ beyond
+    /// gravity_float_abort_rad_).
+    bool gravity_float_active_ = false;
+    std::vector<float> gravity_float_baseline_;  ///< Joint positions at float entry (rad).
+    float gravity_float_abort_rad_ = kGravityFloatAbortRadDefault;  ///< Runaway threshold (rad).
 
     MsgType msg_type_ = MsgType::INVALID;  ///< Message type for teleoperation communication.
 

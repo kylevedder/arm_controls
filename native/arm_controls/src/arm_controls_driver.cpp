@@ -6,7 +6,11 @@
 #include "arm_controls_driver.hpp"
 
 #include "arm_controls_device_config.hpp"
-#include "arm_controls_driver_arx.hpp"
+#include "arm_controls_driver_can_mit.hpp"
+#include "arm_controls_driver_arx_encoder.hpp"
+#include "arm_controls_driver_ft.hpp"
+#include "arm_controls_driver_fr3.hpp"
+#include "arm_controls_driver_trossen.hpp"
 #include "arm_controls_servo.hpp"
 
 Driver::Driver(Device* p_device, const CommandLineArgs& cla) {
@@ -29,12 +33,37 @@ std::shared_ptr<Driver> Driver::new_driver(Device* p_device, const DeviceConfig*
 
     std::shared_ptr<Driver> p_driver = nullptr;
     if (driver_type == p_config->val_driver_type_can) {
-        auto p_driver_arx = std::make_shared<DriverArx>(p_device, cla);
-        p_driver = p_driver_arx;
-        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created CAN 2.0 driver (DriverArx)");
+        auto p_driver_can_mit = std::make_shared<DriverCanMit>(p_device, cla);
+        p_driver = p_driver_can_mit;
+        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created CAN 2.0 driver (DriverCanMit)");
+
+    } else if (driver_type == p_config->val_driver_type_can_encoder) {
+        auto p_driver_encoder = std::make_shared<DriverArxEncoder>(p_device, cla);
+        p_driver = p_driver_encoder;
+        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created CAN read-only encoder driver (DriverArxEncoder)");
+
+    } else if (driver_type == p_config->val_driver_type_trossen) {
+        std::string controller_model;
+        return_code = p_config->get_field_value(p_config->values_, p_config->fn_controller_model, controller_model);
+        if (return_code != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("controller_model is not defined in the model config (required for TROSSEN_ETHERNET)");
+            return nullptr;
+        }
+        p_driver = std::make_shared<DriverTrossen>(p_device, cla, controller_model);
+        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created Trossen controller driver (DriverTrossen, model=%s)",
+                controller_model.c_str());
+
+    } else if (driver_type == p_config->val_driver_type_ft) {
+        p_driver = std::make_shared<DriverFt>(p_device, cla);
+        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created FeeTech driver (DriverFt)");
+
+    } else if (driver_type == p_config->val_driver_type_fr3) {
+        p_driver = std::make_shared<DriverFR3>(p_device, cla);
+        ARM_CONTROLS_INFO("Driver", InfoLevel::HELPFUL_1, "Created libfranka driver (DriverFR3)");
 
     } else {
-        ARM_CONTROLS_ERROR("Unsupported driver type: '%s' (only CAN is supported)", driver_type.c_str());
+        ARM_CONTROLS_ERROR("Unsupported driver type: '%s' (supported types: CAN, CAN_ENCODER, TROSSEN_ETHERNET, FEETECH, FR3)",
+                 driver_type.c_str());
         return nullptr;
     }
 

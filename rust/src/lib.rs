@@ -623,6 +623,7 @@ fn run(
     let mut heartbeat = Instant::now();
     let mut generation = 0;
     let (mut gaps, mut holding) = (0u64, false);
+    let (mut handshake_seen, mut follower_gravity_seen) = (false, false);
     let mut closing = false;
     let mut terminal: Option<String> = None;
     let mut mode = "hold".to_string();
@@ -642,18 +643,21 @@ fn run(
                         || ints[0..2] != [1, 1]
                         || ints[2] & 32 == 0
                         || ints[2] & 1 == 0
-                        || ints[2] & 4 == 0
                     {
-                        return Err(err("incompatible native strict/direct/gravity handshake"));
+                        return Err(err("incompatible native strict/direct handshake"));
                     }
-                    let mut s = shared.0.lock().unwrap();
-                    s.capabilities = Some(ArmCapabilities {
-                        no_recovery_motion: true,
-                        direct_commands: true,
-                        gravity_compensation: true,
-                        dof: 6,
-                        has_effector: true,
-                    });
+                    handshake_seen = true;
+                }
+                33 => {
+                    // CAP_GRAVITY_COMP advertises the leader's gravity mode.
+                    // Followers report applied device-level feed-forward in
+                    // SERVO_PARAM slot 3 (on every arm joint's report).
+                    if ints.len() < 4 || !(0..=6).contains(&ints[0]) || ints[3] != 1 {
+                        return Err(err("native follower gravity compensation not confirmed"));
+                    }
+                    if ints[0] < 6 {
+                        follower_gravity_seen = true;
+                    }
                 }
                 1 => {
                     if terminal.is_none() {
@@ -703,6 +707,15 @@ fn run(
                 }
                 _ => (),
             }
+        }
+        if handshake_seen && follower_gravity_seen {
+            shared.0.lock().unwrap().capabilities = Some(ArmCapabilities {
+                no_recovery_motion: true,
+                direct_commands: true,
+                gravity_compensation: true,
+                dof: 6,
+                has_effector: true,
+            });
         }
         let mut latest = None;
         for _ in 0..256 {

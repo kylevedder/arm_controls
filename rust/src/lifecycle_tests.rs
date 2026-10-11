@@ -49,11 +49,27 @@ fn fake_native_process() {
             0 => statuses
                 .send(&status(
                     30,
-                    &[1, 1, if mode == "bad-handshake" { 5 } else { 37 }],
+                    &[1, 1, if mode == "bad-handshake" { 5 } else { 35 }],
                 ))
                 .unwrap(),
             4 => statuses.send(&status(1, &[])).unwrap(),
             8 => statuses.send(&status(32, &[2])).unwrap(),
+            10 if mode != "missing-gravity" => statuses
+                .send(&status(
+                    33,
+                    &[
+                        0,
+                        1,
+                        1,
+                        if mode == "gravity-off" { 0 } else { 1 },
+                        30000,
+                        1000,
+                        1,
+                        100,
+                        1,
+                    ],
+                ))
+                .unwrap(),
             12 => statuses
                 .send(&status(
                     34,
@@ -187,18 +203,21 @@ fn native_transport_handshake_hold_feedback_and_cleanup() {
         "fault-on-hold",
         "exit-on-hold",
         "bad-handshake",
+        "gravity-off",
+        "missing-gravity",
     ] {
         let fixture = Fixture::new("test", mode);
         let mut session = ArmSession::new();
         let arm = session.add_follower(fixture.config.clone()).unwrap();
         let result = session.connect_followers(|a| a.connect_inner(false));
-        if mode == "bad-handshake" {
+        if ["bad-handshake", "gravity-off", "missing-gravity"].contains(&mode) {
             assert!(result.is_err());
             fixture.dead();
             continue;
         }
         result.unwrap();
         assert!(arm.capabilities().unwrap().no_recovery_motion);
+        assert!(arm.capabilities().unwrap().gravity_compensation);
         let s = arm.read_state(Duration::from_millis(500)).unwrap();
         assert!(s.generation > 0);
         assert_eq!(s.frame_age_ms, [2.; 7]);

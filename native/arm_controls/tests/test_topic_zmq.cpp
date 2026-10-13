@@ -169,6 +169,34 @@ TEST(CoherentFeedbackWire, PairedSubscriberPreservesRawPrefixForLegacyAndUnknown
     EXPECT_EQ(device.follower_action_count, 2);
 }
 
+TEST(CoherentFeedbackWire, CommandDrainsRejectEmptyAndExtendedPayloads) {
+    for (const bool direct : {false, true}) {
+        CommandLineArgs cla = make_cla();
+        cla.topic_direct_command = "topic_zmq_test_direct_" + cla.device_id;
+        TestDevice device(cla, 1);
+        TopicZmq topic(&device, cla, 0, nullptr);
+        topic.set_pause_leader_command_listening(false);
+        auto& sub = direct ? topic.sub_direct_joint_ : topic.sub_joint_;
+        const auto& name = direct ? topic.topic_direct_command_ : topic.topic_joint_;
+        sub.close();
+        sub = zmq::socket_t(topic.context_, ZMQ_PAIR);
+        const std::string endpoint = "inproc://command_size_rejection_" + cla.device_id;
+        sub.bind(endpoint);
+        zmq::socket_t sender(topic.context_, ZMQ_PAIR);
+        sender.connect(endpoint);
+
+        ZmqJointState state{};
+        state.raw.msg_type = static_cast<int>(MsgType::JOINT_INFO);
+        state.raw.joint_num = 1;
+        for (const size_t size : {size_t{0}, sizeof(state)}) {
+            sender.send(zmq::buffer(name), zmq::send_flags::sndmore);
+            sender.send(zmq::buffer(&state, size), zmq::send_flags::none);
+            EXPECT_EQ(topic.step(), ReturnCode::INVALID_PARAM);
+            EXPECT_EQ(device.joint_action_count, 0);
+        }
+    }
+}
+
 TEST_F(TopicZmqPublishBoundsTest, RejectsJointPayloadLargerThanWireArray) {
     MsgJoints msg;
     for (int i = 0; i < 11; ++i) {

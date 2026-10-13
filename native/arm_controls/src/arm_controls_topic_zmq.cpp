@@ -204,7 +204,7 @@ static DrainResult drain_sub_to_latest(zmq::socket_t& sub, const std::string& ex
             result.record_error(ReturnCode::INVALID_PARAM);
             continue;
         }
-        if (message.size() != expected_size && message.size() != extended_size) {
+        if (message.size() != expected_size && (extended_size == 0 || message.size() != extended_size)) {
             ARM_CONTROLS_ERROR("Received message size (%zu) does not match expected sizes (%zu, %zu)", message.size(),
                      expected_size, extended_size);
             result.record_error(ReturnCode::INVALID_PARAM);

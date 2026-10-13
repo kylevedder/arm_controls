@@ -52,3 +52,11 @@ successful native IPC send; it proves submission, never actuator execution.
 `lifecycle_sequence` and `lifecycle_received_mono_ns` expose changes even when no
 new state payload arrives. A sequence jump means intermediate mode/hold changes
 were not observed. The native strict safety overlay is unchanged by telemetry.
+
+The native mode producer reports actual accepted target buffers and existing
+readiness, gravity, recovery and shutdown state. Status 32 precedes a lifecycle
+ACK and carries `[mode, sequence_low_u32, sequence_high_u32]`; periodic repeats
+retain that cumulative sequence. Rust also accepts the legacy one-int status.
+Feedback-gap holds remain separate status 34 evidence, so the same automatic
+pause is not counted again as a base-mode HOLD. Lifecycle time is the Rust
+worker's actual status receipt time; repeats never restamp it or motor samples.

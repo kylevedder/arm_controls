@@ -60,6 +60,9 @@
 #define DEVICE_INFO_PROTOCOL_HANDSHAKE 30
 #define DEVICE_INFO_COMMAND_ACK        31
 #define DEVICE_INFO_RUNTIME_MODE       32
+// Base mode index (disconnected/connecting/hold/direct/gravity/bilateral/ready/
+// recovery/closed), then cumulative transition sequence as low/high uint32 bits.
+// Repeats retain the sequence. Feedback-gap holds are reported separately by 34.
 // Per-joint servo parameter report (one message per arm joint, re-announced with the
 // handshake so late subscribers always receive it):
 //   param_int[0]   = joint index (0-based)

@@ -95,6 +95,7 @@ ReturnCode DeviceFR3::apply_action(const MsgJoints& msg) {
     if (result == ReturnCode::SUCCESS && robotiq_) {
         robotiq_->set_target(msg.joints_[7].curr_pos_, robotiq_default_speed_, robotiq_default_force_);
     }
+    if (result == ReturnCode::SUCCESS) runtime_target_active_ = true;
     return result;
 }
 
@@ -191,13 +192,12 @@ ReturnCode DeviceFR3::set_control_mode(Role target_role, ControlModeIntent inten
     return target_role == Role::FOLLOWER ? ReturnCode::SUCCESS : ReturnCode::NOT_SUPPORTED;
 }
 
-ReturnCode DeviceFR3::runtime_hold() {
-    if (rejects_direct_commands()) return ReturnCode::BUSY;
-    clear_command_buffers_for_move_to_ready();
-    return ReturnCode::SUCCESS;
+ReturnCode DeviceFR3::runtime_hold(bool feedback_gap) {
+    return Device::runtime_hold(feedback_gap);
 }
 
 void DeviceFR3::clear_command_buffers_for_move_to_ready() {
+    runtime_target_active_ = false;
     if (driver_fr3_) driver_fr3_->hold();
     if (robotiq_) robotiq_->hold();
 }

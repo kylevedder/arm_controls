@@ -647,6 +647,7 @@ fn run(
     let mut closing = false;
     let mut terminal: Option<String> = None;
     let mut mode = "hold".to_string();
+    let mut native_mode_sequence = None;
     let mut lifecycle_sequence = 0u64;
     let mut lifecycle_received_mono_ns = 0u64;
     loop {
@@ -706,8 +707,26 @@ fn run(
                         .get(index as usize)
                         .ok_or_else(|| err("invalid native mode"))?
                         .to_string();
-                    if next_mode != mode {
-                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                    // New native producers repeat a cumulative mode counter.
+                    // Keep one-int legacy status readable, but do not erase
+                    // missed edges merely because the final mode is unchanged.
+                    let next_sequence = if ints.len() >= 3 {
+                        Some(ints[1] as u32 as u64 | ((ints[2] as u32 as u64) << 32))
+                    } else {
+                        None
+                    };
+                    let steps = match (next_sequence, native_mode_sequence) {
+                        (Some(next), Some(previous)) if next > previous => next - previous,
+                        (Some(next), Some(previous)) if next == previous && next_mode == mode => 0,
+                        (Some(_), Some(_)) => 2, // Inconsistent/regressed metadata: expose a gap.
+                        (Some(_), None) => 1,
+                        (None, _) => u64::from(next_mode != mode),
+                    };
+                    if next_sequence.is_some() {
+                        native_mode_sequence = next_sequence;
+                    }
+                    if steps > 0 {
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(steps);
                         lifecycle_received_mono_ns = monotonic_ns();
                         mode = next_mode;
                     }

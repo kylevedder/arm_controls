@@ -684,7 +684,11 @@ class Device {
         return ReturnCode::NOT_SUPPORTED;
     }
 
-    virtual ReturnCode runtime_hold();
+    virtual ReturnCode runtime_hold(bool feedback_gap = false);
+
+    /// Observation-only base mode, independent of the feedback-gap latch (status 34).
+    int runtime_mode() const;
+    void publish_runtime_mode() noexcept;
 
     /*!
      * @brief Records a client-liveness heartbeat (DEVICE_COMMAND_HEARTBEAT).
@@ -828,6 +832,12 @@ class Device {
     /// in-loop runaway watchdog (drift from gravity_float_baseline_ beyond
     /// gravity_float_abort_rad_).
     bool gravity_float_active_ = false;
+    // Control-thread-only diagnostic evidence of accepted native target buffers,
+    // never a control gate. TopicZmq::step publishes on this same thread.
+    bool runtime_target_active_ = false;
+    int runtime_mode_last_ = -1;
+    uint64_t runtime_mode_sequence_ = 0;
+    std::chrono::steady_clock::time_point runtime_mode_last_publish_{};
     std::vector<float> gravity_float_baseline_;  ///< Joint positions at float entry (rad).
     float gravity_float_abort_rad_ = kGravityFloatAbortRadDefault;  ///< Runaway threshold (rad).
 

@@ -6,6 +6,8 @@
 #include <vector>
 #include <mutex>
 #include <cmath>
+#include <cstring>
+#include <limits>
 
 #include "arm_controls_device.hpp"
 #include "arm_controls_device_arm_can.hpp"
@@ -47,12 +49,51 @@ ReturnCode Device::set_runtime_force_feedback_gain(float gain) {
     return ReturnCode::SUCCESS;
 }
 
-ReturnCode Device::runtime_hold() {
+ReturnCode Device::runtime_hold(bool feedback_gap) {
     if (rejects_direct_commands()) {
         return ReturnCode::BUSY;
     }
+    const bool prior_target_active = runtime_target_active_;
     clear_command_buffers_for_move_to_ready();
+    // Automatic receive pauses have their own cumulative status 34. Preserve
+    // the base mode so one physical feedback pause is not counted twice.
+    if (feedback_gap) runtime_target_active_ = prior_target_active;
     return ReturnCode::SUCCESS;
+}
+
+int Device::runtime_mode() const {
+    if (p_topic_ && !p_topic_->is_running()) return 8;
+    if (is_in_emergency_recovery()) return 7;
+    if (move_to_ready_cmd_state_ != MoveToReadyCmdState::IDLE) return 6;
+    if (!is_ready_) return 1;
+    if (gravity_float_active_) return 4;
+    if (role_ == Role::LEADER) return enabled_force_feedback_ ? 5 : 4;
+    if (role_ == Role::FOLLOWER) return runtime_target_active_ ? 3 : 2;
+    return 0;
+}
+
+void Device::publish_runtime_mode() noexcept {
+    // Optional observation must never change a control result or fault path.
+    if (!p_topic_) return;
+    try {
+        const int mode = runtime_mode();
+        const bool changed = mode != runtime_mode_last_;
+        if (changed) {
+            runtime_mode_last_ = mode;
+            if (runtime_mode_sequence_ != std::numeric_limits<uint64_t>::max()) ++runtime_mode_sequence_;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!changed && now - runtime_mode_last_publish_ < std::chrono::milliseconds(100)) return;
+        runtime_mode_last_publish_ = now;
+        const uint32_t words[2] = {static_cast<uint32_t>(runtime_mode_sequence_),
+                                   static_cast<uint32_t>(runtime_mode_sequence_ >> 32)};
+        std::vector<int> data{mode, 0, 0};
+        std::memcpy(data.data() + 1, words, sizeof(words));
+        (void)publish_device_info(DEVICE_INFO_RUNTIME_MODE, nullptr, &data);
+    } catch (...) {
+        // A lost status is visible in the next cumulative sequence; actuation
+        // retains its existing error handling and disable-only behavior.
+    }
 }
 
 bool Device::is_running() {

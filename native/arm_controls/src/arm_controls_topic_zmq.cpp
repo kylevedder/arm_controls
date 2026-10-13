@@ -231,6 +231,8 @@ static bool joint_info_count_is_valid(const ZmqJointInfo& zmq_msg, int device_do
 }
 
 ReturnCode TopicZmq::step() {
+    // Capture native state reached before command dispatch (including startup).
+    p_device_->publish_runtime_mode();
     bool discard_motion_this_step = false;
     ReturnCode first_error = ReturnCode::SUCCESS;
     auto record_result = [&first_error](ReturnCode result) {
@@ -305,6 +307,8 @@ ReturnCode TopicZmq::step() {
                                 if (msg.command_ == DEVICE_COMMAND_HOLD) discard_motion_this_step = true;
                                 const ReturnCode command_result =
                                     record_result(Topic::process_leader_msg(msg));
+                                // A successful HOLD's native mode precedes its ACK.
+                                p_device_->publish_runtime_mode();
                                 const int request_id = msg.num_param_int_ > 0 ? msg.param_int_[0] : 0;
                                 std::vector<int> ack_data{request_id, static_cast<int>(command_result), msg.command_};
                                 p_device_->publish_device_info(DEVICE_INFO_COMMAND_ACK, nullptr, &ack_data);
@@ -378,8 +382,7 @@ ReturnCode TopicZmq::step() {
             record_result(process_leader_msg_joystick(&latest_right, MsgJoystick::Side::RIGHT));
         }
     }
-
-
+    p_device_->publish_runtime_mode();
     return first_error;
 }
 

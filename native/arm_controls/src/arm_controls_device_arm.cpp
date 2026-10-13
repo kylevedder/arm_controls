@@ -189,7 +189,7 @@ ReturnCode DeviceArm::publish_next_servo_param() {
     return publish_device_info(DEVICE_INFO_SERVO_PARAM, &floats, &ints);
 }
 
-ReturnCode DeviceArm::runtime_hold() {
+ReturnCode DeviceArm::runtime_hold(bool feedback_gap) {
     if (gravity_float_active_) {
         ReturnCode return_code = set_runtime_gravity_float(false, 0.0f);
         if (return_code != ReturnCode::SUCCESS) {
@@ -197,7 +197,7 @@ ReturnCode DeviceArm::runtime_hold() {
         }
     }
     // A pause must retire the attached gripper target as well as arm targets.
-    const ReturnCode arm_rc = Device::runtime_hold();
+    const ReturnCode arm_rc = Device::runtime_hold(feedback_gap);
     if (arm_rc != ReturnCode::SUCCESS) return arm_rc;
     if (p_effector_) {
         const auto rc = p_effector_->runtime_hold();
@@ -242,6 +242,7 @@ void DeviceArm::reset_ready_state_for_move_to_ready() {
 }
 
 void DeviceArm::clear_command_buffers_for_move_to_ready() {
+    runtime_target_active_ = false;
     // Overwrite buffered leader targets so the follower holds position after
     // returning from move-to-ready.
     int i = 0;
@@ -559,7 +560,7 @@ ReturnCode DeviceArm::read_hardware_values() {
 
     if (cla_.no_recovery_motion && is_ready_ && p_driver_) {
         if (p_driver_->feedback_gap_active() && !feedback_hold_latched_) {
-            const auto hold_rc = runtime_hold();
+            const auto hold_rc = runtime_hold(true);
             if (hold_rc != ReturnCode::SUCCESS) return hold_rc;
             feedback_hold_latched_ = true;
             ++feedback_gap_count_;
@@ -1329,6 +1330,7 @@ ReturnCode DeviceArm::apply_action(const MsgJoints& msg) {
         return_code = p_effector_->apply_action(msg);
     }
 
+    if (return_code == ReturnCode::SUCCESS) runtime_target_active_ = true;
     return return_code;
 }
 

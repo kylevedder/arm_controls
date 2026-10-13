@@ -1,4 +1,6 @@
 #include <atomic>
+#include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -9,6 +11,7 @@
 #include <zmq.hpp>
 
 #include "arm_controls_device.hpp"
+#include "arm_controls_device_arm.hpp"
 #include "arm_controls_profile.hpp"
 
 #define private public
@@ -59,6 +62,18 @@ class TestDevice : public Device {
     MsgJoints last_follower_msg;
 };
 
+// Exercise the production arm handlers with an empty, hardware-free joint set.
+class RuntimeModeTestArm : public DeviceArm {
+   public:
+    explicit RuntimeModeTestArm(const CommandLineArgs& cla) : DeviceArm(cla) {
+        role_ = Role::FOLLOWER;
+        is_ready_ = true;
+        dof_total_ = 0;
+    }
+    void attach_topic(std::shared_ptr<Topic> topic) { p_topic_ = std::move(topic); }
+    void latch_feedback_hold(bool value) { feedback_hold_latched_ = value; }
+};
+
 CommandLineArgs make_cla() {
     static std::atomic<unsigned int> next_id{0};
     const std::string suffix = std::to_string(getpid()) + "_" + std::to_string(next_id.fetch_add(1));
@@ -102,6 +117,126 @@ TEST(CoherentFeedbackWire, RawAbiAndReservedTailRemainExplicit) {
         EXPECT_EQ(state.feedback[i].sample_id, 0u);
         EXPECT_EQ(state.feedback[i].received_mono_ns, 0u);
     }
+}
+
+TEST(RuntimeModeStatus, NativeAcceptedTargetAndHoldProduceSequencedModeBeforeAck) {
+    CommandLineArgs cla = make_cla();
+    cla.no_recovery_motion = true;
+    cla.topic_direct_command = "runtime_mode_direct_" + cla.device_id;
+    RuntimeModeTestArm device(cla);
+    auto topic = std::make_shared<TopicZmq>(&device, cla, 0, nullptr);
+    device.attach_topic(topic);
+
+    auto pair = [&](zmq::socket_t& socket, const std::string& name) {
+        socket.close();
+        socket = zmq::socket_t(topic->context_, ZMQ_PAIR);
+        const std::string endpoint = "inproc://" + name + cla.device_id;
+        socket.bind(endpoint);
+        zmq::socket_t peer(topic->context_, ZMQ_PAIR);
+        peer.connect(endpoint);
+        return peer;
+    };
+    auto statuses = pair(topic->pub_device_info_, "runtime_status_");
+    auto commands = pair(topic->sub_command_, "runtime_lifecycle_");
+    auto direct = pair(topic->sub_direct_joint_, "runtime_direct_");
+    auto receive = [&]() -> std::optional<ZmqDeviceInfo> {
+        zmq::message_t name, payload;
+        if (!statuses.recv(name, zmq::recv_flags::dontwait)) return std::nullopt;
+        if (!statuses.recv(payload, zmq::recv_flags::dontwait) || payload.size() != sizeof(ZmqDeviceInfo))
+            return std::nullopt;
+        ZmqDeviceInfo result{};
+        std::memcpy(&result, payload.data(), sizeof(result));
+        return result;
+    };
+    auto sequence = [](const ZmqDeviceInfo& status) {
+        return static_cast<uint64_t>(static_cast<uint32_t>(status.param_int[1])) |
+               (static_cast<uint64_t>(static_cast<uint32_t>(status.param_int[2])) << 32);
+    };
+    auto send_target = [&](int joints) {
+        ZmqJointInfo target{};
+        target.msg_type = static_cast<int>(MsgType::JOINT_INFO);
+        target.joint_num = joints;
+        direct.send(zmq::buffer(cla.topic_direct_command), zmq::send_flags::sndmore);
+        direct.send(zmq::buffer(&target, sizeof(target)), zmq::send_flags::none);
+    };
+    auto send_hold = [&]() {
+        ZmqCommand hold{};
+        hold.command = DEVICE_COMMAND_HOLD;
+        hold.num_param_int = 1;
+        hold.param_int[0] = 17;
+        commands.send(zmq::buffer(cla.topic_lifecycle), zmq::send_flags::sndmore);
+        commands.send(zmq::buffer(&hold, sizeof(hold)), zmq::send_flags::none);
+    };
+
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    auto state = receive();
+    ASSERT_TRUE(state.has_value()) << "native state 32 must be produced, not only consumed";
+    ASSERT_EQ(state->info_key, DEVICE_INFO_RUNTIME_MODE);
+    ASSERT_EQ(state->num_param_int, 3);
+    EXPECT_EQ(state->param_int[0], 2);
+    EXPECT_EQ(sequence(*state), 1u);
+
+    send_target(0);
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    state = receive();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->param_int[0], 3);
+    EXPECT_EQ(sequence(*state), 2u);
+    // The automatic gap handler clears buffers but keeps the base mode; its
+    // separate status 34 owns that pause instead of inventing a second edge.
+    ASSERT_EQ(device.runtime_hold(true), ReturnCode::SUCCESS);
+    device.latch_feedback_hold(true);
+    send_target(0);
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    while (auto gap_repeat = receive()) {
+        ASSERT_EQ(gap_repeat->info_key, DEVICE_INFO_RUNTIME_MODE);
+        EXPECT_EQ(gap_repeat->param_int[0], 3);
+        EXPECT_EQ(sequence(*gap_repeat), 2u);
+    }
+    send_hold();
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    state = receive();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->info_key, DEVICE_INFO_RUNTIME_MODE);
+    EXPECT_EQ(state->param_int[0], 2);
+    EXPECT_EQ(sequence(*state), 3u);
+    auto ack = receive();
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->info_key, DEVICE_INFO_COMMAND_ACK);
+    EXPECT_EQ(ack->param_int[0], 17);
+    EXPECT_EQ(ack->param_int[1], static_cast<int>(ReturnCode::SUCCESS));
+
+    send_hold();
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    // Repeated explicit HOLD and periodic re-announcements retain the counter.
+    while (auto repeated = receive()) {
+        if (repeated->info_key == DEVICE_INFO_RUNTIME_MODE) EXPECT_EQ(sequence(*repeated), 3u);
+    }
+    device.latch_feedback_hold(true);
+    send_target(0); // Native drops this without applying target buffers.
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    device.latch_feedback_hold(false);
+    send_target(1); // Native rejects the wrong joint count.
+    ASSERT_EQ(topic->step(), ReturnCode::INVALID_PARAM);
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    state = receive();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->param_int[0], 2);
+    EXPECT_EQ(sequence(*state), 3u);
+
+    // The native counter retains a complete intermediate direct/HOLD episode
+    // even if a subscriber only keeps its final (same-mode) announcement.
+    send_target(0);
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    ASSERT_TRUE(receive().has_value());
+    send_hold();
+    ASSERT_EQ(topic->step(), ReturnCode::SUCCESS);
+    state = receive();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->info_key, DEVICE_INFO_RUNTIME_MODE);
+    EXPECT_EQ(state->param_int[0], 2);
+    EXPECT_EQ(sequence(*state), 5u);
 }
 
 TEST(CoherentFeedbackWire, PublishedExtendedStateReachesPairedSubscriberAndCommandsStayLegacy) {

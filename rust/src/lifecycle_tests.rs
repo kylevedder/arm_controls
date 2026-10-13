@@ -29,7 +29,7 @@ fn fake_native_process() {
     let mode = fs::read_to_string(dir.join("mode")).unwrap();
     let stop_feedback = matches!(
         mode.as_str(),
-        "status-without-feedback" | "coalesced-feedback-gaps"
+        "status-without-feedback" | "coalesced-feedback-gaps" | "coalesced-runtime-modes"
     );
     let ctx = transport::Context::new(None).unwrap();
     let states = transport::Socket::new(&ctx, &arg("--topic_state"), true).unwrap();
@@ -107,6 +107,15 @@ fn fake_native_process() {
                 // Repeat like native cumulative status so fixture scheduling
                 // cannot make the observation depend on one queued datagram.
                 statuses.send(&status(34, &values)).unwrap();
+            }
+        }
+        if mode == "coalesced-runtime-modes" && n >= 50 {
+            if let Ok(request) = fs::read_to_string(dir.join("runtime-mode-status")) {
+                let values: Vec<i32> = request
+                    .split_whitespace()
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                statuses.send(&status(32, &values)).unwrap();
             }
         }
         if let Some(b) = direct.recv().unwrap() {
@@ -248,6 +257,62 @@ fn lifecycle_transitions_are_visible_without_new_feedback_and_receipt_is_ipc_onl
         arm.command_with_receipt(PositionCommand::new([0.; 6], 0.5).unwrap())
             .is_err()
     );
+    fixture.dead();
+}
+#[test]
+fn cumulative_native_modes_keep_missed_edges_and_repeats_do_not_restamp_feedback() {
+    let fixture = Fixture::new("mode-history", "coalesced-runtime-modes");
+    let mut session = ArmSession::new();
+    let arm = session.add_follower(fixture.config.clone()).unwrap();
+    session
+        .connect_followers(|a| a.connect_inner(false))
+        .unwrap();
+    let observe = |mode: i32, sequence: u64, expected_lifecycle: u64| {
+        let next = fixture.dir.join("runtime-mode-status-next");
+        fs::write(
+            &next,
+            format!(
+                "{mode} {} {}",
+                sequence as u32 as i32,
+                (sequence >> 32) as u32 as i32
+            ),
+        )
+        .unwrap();
+        fs::rename(next, fixture.dir.join("runtime-mode-status")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = arm.latest_state().unwrap().unwrap();
+            if state.lifecycle_sequence == expected_lifecycle {
+                break state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mode status not delivered: {state:?}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let first = observe(3, u32::MAX as u64, 1);
+    assert_eq!(first.mode, "direct");
+    thread::sleep(Duration::from_millis(30));
+    let repeated = arm.latest_state().unwrap().unwrap();
+    assert_eq!(repeated.lifecycle_sequence, first.lifecycle_sequence);
+    assert_eq!(
+        repeated.lifecycle_received_mono_ns,
+        first.lifecycle_received_mono_ns
+    );
+    // Cross the low-word boundary while skipping HOLD and returning to direct.
+    let missed = observe(3, u32::MAX as u64 + 2, 3);
+    assert_eq!(missed.mode, "direct");
+    assert!(missed.lifecycle_received_mono_ns > first.lifecycle_received_mono_ns);
+    let held = observe(2, u32::MAX as u64 + 3, 4);
+    assert_eq!(held.mode, "hold");
+    for state in [&repeated, &missed, &held] {
+        assert_eq!(state.generation, first.generation);
+        assert_eq!(state.received_mono_ns, first.received_mono_ns);
+        assert_eq!(state.feedback_samples, first.feedback_samples);
+    }
+    session.close().unwrap();
     fixture.dead();
 }
 #[test]

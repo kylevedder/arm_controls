@@ -169,7 +169,7 @@ class DeviceArm : public Device {
      */
     ReturnCode publish_next_servo_param() override;
 
-    ReturnCode runtime_hold() override;
+    ReturnCode runtime_hold(bool feedback_gap = false) override;
 
     /*!
      * @brief UI-facing progress estimate for any active move-to-ready.

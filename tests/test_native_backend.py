@@ -942,21 +942,23 @@ class ObservedCondition:
         self._condition.notify_all()
 
 
-def test_consume_state_rejects_wrong_payload_size():
+@pytest.mark.parametrize("payload_size", [7, 251, 253, 495, 497])
+def test_consume_state_rejects_wrong_payload_size(payload_size):
     backend = make_consuming_backend()
     with pytest.raises(ProtocolError, match="payload size"):
-        backend._consume_state(b"\x00" * 7)
+        backend._consume_state(b"\x00" * payload_size)
     backend.close()
 
 
-def test_consume_state_accepts_versioned_coherent_extension_without_changing_raw_fields():
-    import sys
+@pytest.mark.parametrize("feedback_version", [1, 99])
+def test_consume_state_accepts_versioned_coherent_extension_without_changing_raw_fields(feedback_version):
     backend = make_consuming_backend()
-    raw = pack_state([0.1] * 6, sequence=17)
-    backend._consume_state(raw + (1).to_bytes(4, sys.byteorder) + bytes(240))
+    raw = pack_state([0.1] * 6, velocities=[-0.2] * 6, frame_ages=[12.5] * 6, sequence=17)
+    backend._consume_state(raw + feedback_version.to_bytes(4, sys.byteorder) + bytes(240))
     assert backend._state.joints.position_rad == pytest.approx([0.1] * 6)
-    with pytest.raises(ProtocolError, match="payload size"):
-        backend._consume_state(raw + (99).to_bytes(4, sys.byteorder) + bytes(240))
+    assert backend._state.joints.velocity_rad_s == pytest.approx([-0.2] * 6)
+    assert backend._state.joints.frame_age_ms == pytest.approx([12.5] * 6)
+    assert backend._state.sequence == 17
     backend.close()
 
 

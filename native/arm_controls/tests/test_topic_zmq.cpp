@@ -1,6 +1,7 @@
 #include <atomic>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -32,8 +33,9 @@ class TestDevice : public Device {
         return ReturnCode::SUCCESS;
     }
     ReturnCode get_observation(MsgJoints&) override { return ReturnCode::SUCCESS; }
-    ReturnCode process_follower_msg(const MsgJoints&) override {
+    ReturnCode process_follower_msg(const MsgJoints& msg) override {
         ++follower_action_count;
+        last_follower_msg = msg;
         return ReturnCode::SUCCESS;
     }
     ReturnCode read_hardware_values() override { return ReturnCode::SUCCESS; }
@@ -54,6 +56,7 @@ class TestDevice : public Device {
     int joint_action_count = 0;
     int joystick_action_count = 0;
     int follower_action_count = 0;
+    MsgJoints last_follower_msg;
 };
 
 CommandLineArgs make_cla() {
@@ -99,6 +102,71 @@ TEST(CoherentFeedbackWire, RawAbiAndReservedTailRemainExplicit) {
         EXPECT_EQ(state.feedback[i].sample_id, 0u);
         EXPECT_EQ(state.feedback[i].received_mono_ns, 0u);
     }
+}
+
+TEST(CoherentFeedbackWire, PublishedExtendedStateReachesPairedSubscriberAndCommandsStayLegacy) {
+    CommandLineArgs follower_cla = make_cla();
+    TestDevice follower_device(follower_cla, 1);
+    TopicZmq follower(&follower_device, follower_cla, 0, nullptr);
+    follower.set_pause_leader_command_listening(false);
+
+    CommandLineArgs leader_cla = make_cla();
+    leader_cla.role = Role::LEADER;
+    leader_cla.topic_joint = follower_cla.topic_joint;
+    leader_cla.paired_follower_state_topic = follower_cla.topic_state;
+    TestDevice leader_device(leader_cla, 1);
+    TopicZmq leader(&leader_device, leader_cla, 0, nullptr);
+
+    MsgJoints msg;
+    msg.add_joint_info(0.25f, -0.5f, 0.75f, 23.0f, 1.5f, 12.0f,
+                       FeedbackSample{0.25f, -0.5f, 123456789, 42});
+    msg.measured_idc_current_ = 2.5f;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (leader_device.follower_action_count == 0 || follower_device.joint_action_count == 0) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+        ASSERT_EQ(follower.publish(msg), ReturnCode::SUCCESS);
+        ASSERT_EQ(leader.publish(msg), ReturnCode::SUCCESS);
+        ASSERT_EQ(leader.step(), ReturnCode::SUCCESS);
+        ASSERT_EQ(follower.step(), ReturnCode::SUCCESS);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // Both messages went through the production publisher and socket drains.
+    // The command drain above still rejects every size other than 252 bytes.
+    ASSERT_EQ(leader_device.last_follower_msg.joints_.size(), 1u);
+    const auto& joint = leader_device.last_follower_msg.joints_[0];
+    EXPECT_FLOAT_EQ(joint.curr_pos_, 0.25f);
+    EXPECT_FLOAT_EQ(joint.curr_vel_, -0.5f);
+    EXPECT_FLOAT_EQ(joint.curr_tor_, 0.75f);
+    EXPECT_FLOAT_EQ(joint.temperature_, 23.0f);
+    EXPECT_FLOAT_EQ(joint.idc_current_, 1.5f);
+    EXPECT_FLOAT_EQ(joint.frame_age_ms_, 12.0f);
+    EXPECT_FLOAT_EQ(leader_device.last_follower_msg.measured_idc_current_, 2.5f);
+}
+
+TEST(CoherentFeedbackWire, PairedSubscriberPreservesRawPrefixForLegacyAndUnknownExtension) {
+    CommandLineArgs cla = make_cla();
+    TestDevice device(cla, 1);
+    TopicZmq topic(&device, cla, 0, nullptr);
+    topic.sub_follower_joint_.close();
+    topic.sub_follower_joint_ = zmq::socket_t(topic.context_, ZMQ_PAIR);
+    const std::string endpoint = "inproc://follower_state_compat_" + cla.device_id;
+    topic.sub_follower_joint_.bind(endpoint);
+    zmq::socket_t sender(topic.context_, ZMQ_PAIR);
+    sender.connect(endpoint);
+
+    ZmqJointState state{};
+    state.raw.msg_type = static_cast<int>(MsgType::JOINT_INFO);
+    state.raw.joint_num = 1;
+    state.raw.joint_pos[0] = 0.25f;
+    state.feedback_version = 99;
+    for (const size_t size : {sizeof(ZmqJointInfo), sizeof(ZmqJointState)}) {
+        sender.send(zmq::buffer(topic.topic_follower_joint_), zmq::send_flags::sndmore);
+        sender.send(zmq::buffer(&state, size), zmq::send_flags::none);
+        ASSERT_EQ(topic.step(), ReturnCode::SUCCESS);
+        ASSERT_EQ(device.last_follower_msg.joints_.size(), 1u);
+        EXPECT_FLOAT_EQ(device.last_follower_msg.joints_[0].curr_pos_, 0.25f);
+    }
+    EXPECT_EQ(device.follower_action_count, 2);
 }
 
 TEST_F(TopicZmqPublishBoundsTest, RejectsJointPayloadLargerThanWireArray) {

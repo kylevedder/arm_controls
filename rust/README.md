@@ -38,6 +38,14 @@ seven optional snapshots in calibrated radians and normalized gripper opening;
 velocity uses the same coordinate per second. Legacy raw state/velocity fields
 retain their prior semantics. Unsupported/malformed optional samples are absent.
 Receive time is host parse time, not the motor's sensing instant.
+On an inverted joint, coherent velocity therefore has the sign of calibrated
+position's derivative and can differ from the unchanged legacy raw velocity.
+Production native and Rust receive clocks both use Linux CLOCK_MONOTONIC;
+the macOS Rust clock is used only by the no-hardware test fixture.
+
+Paired native state subscribers and Python readers accept both the legacy
+252-byte state and the 496-byte state, preserving the raw prefix even when the
+optional telemetry version is unknown. Command messages remain exactly 252 bytes.
 
 `command_with_receipt` returns the worker's monotonic time immediately after a
 successful native IPC send; it proves submission, never actuator execution.

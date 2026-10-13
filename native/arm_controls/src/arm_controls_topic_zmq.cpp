@@ -154,7 +154,7 @@ struct DrainResult {
 };
 
 static DrainResult drain_sub_to_latest(zmq::socket_t& sub, const std::string& expected_topic, void* p_latest,
-                                       size_t expected_size) {
+                                       size_t expected_size, size_t extended_size = 0) {
     DrainResult result;
     while (true) {
         zmq::message_t topic_msg;
@@ -204,13 +204,16 @@ static DrainResult drain_sub_to_latest(zmq::socket_t& sub, const std::string& ex
             result.record_error(ReturnCode::INVALID_PARAM);
             continue;
         }
-        if (message.size() != expected_size) {
-            ARM_CONTROLS_ERROR("Received message size (%zu) does not match expected size (%zu)", message.size(),
-                     expected_size);
+        if (message.size() != expected_size && message.size() != extended_size) {
+            ARM_CONTROLS_ERROR("Received message size (%zu) does not match expected sizes (%zu, %zu)", message.size(),
+                     expected_size, extended_size);
             result.record_error(ReturnCode::INVALID_PARAM);
             continue;
         }
 
+        // Only state subscribers opt into the extension. Their existing
+        // physical behavior consumes the unchanged raw prefix regardless of
+        // optional telemetry version; command drains still require exact size.
         memcpy(p_latest, message.data(), expected_size);
         result.have_payload = true;
     }
@@ -348,7 +351,7 @@ ReturnCode TopicZmq::step() {
         ZmqJointInfo latest_follower{};
         const DrainResult drain_result =
             drain_sub_to_latest(sub_follower_joint_, topic_follower_joint_, &latest_follower,
-                                sizeof(latest_follower));
+                                sizeof(latest_follower), sizeof(ZmqJointState));
         record_result(drain_result.first_error);
         if (drain_result.have_payload) {
             record_result(process_follower_msg_joint(&latest_follower));

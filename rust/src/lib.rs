@@ -723,12 +723,25 @@ fn run(
                     {
                         return Err(err("invalid feedback-gap status"));
                     }
-                    if gaps != ints[0] as u64 || holding != (ints[1] != 0) {
-                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                    let next_gaps = ints[0] as u64;
+                    let next_holding = ints[1] != 0;
+                    if gaps != next_gaps || holding != next_holding {
+                        // Each new gap enters HOLD; every later episode must
+                        // first leave it. Preserve that lower bound even when
+                        // repeated cumulative status skips intermediate edges.
+                        let steps = if next_gaps > gaps {
+                            (next_gaps - gaps)
+                                .saturating_mul(2)
+                                .saturating_add(u64::from(holding))
+                                .saturating_sub(u64::from(next_holding))
+                        } else {
+                            1
+                        };
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(steps);
                         lifecycle_received_mono_ns = monotonic_ns();
                     }
-                    gaps = ints[0] as u64;
-                    holding = ints[1] != 0;
+                    gaps = next_gaps;
+                    holding = next_holding;
                 }
                 31 => {
                     if ints.len() < 2 {

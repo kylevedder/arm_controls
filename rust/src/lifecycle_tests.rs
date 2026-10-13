@@ -27,6 +27,10 @@ fn fake_native_process() {
     assert_eq!(arg("--follower_gravity_compensation"), "true");
     fs::write(dir.join("pid"), std::process::id().to_string()).unwrap();
     let mode = fs::read_to_string(dir.join("mode")).unwrap();
+    let stop_feedback = matches!(
+        mode.as_str(),
+        "status-without-feedback" | "coalesced-feedback-gaps"
+    );
     let ctx = transport::Context::new(None).unwrap();
     let states = transport::Socket::new(&ctx, &arg("--topic_state"), true).unwrap();
     let statuses = transport::Socket::new(&ctx, &arg("--topic_status"), true).unwrap();
@@ -53,28 +57,24 @@ fn fake_native_process() {
                 ))
                 .unwrap(),
             4 => statuses.send(&status(1, &[])).unwrap(),
-            8 if mode != "status-without-feedback" || n < 40 => {
-                statuses.send(&status(32, &[2])).unwrap()
-            }
-            10 if mode != "missing-gravity" && (mode != "status-without-feedback" || n < 40) => {
-                statuses
-                    .send(&status(
-                        33,
-                        &[
-                            0,
-                            1,
-                            1,
-                            if mode == "gravity-off" { 0 } else { 1 },
-                            30000,
-                            1000,
-                            1,
-                            100,
-                            1,
-                        ],
-                    ))
-                    .unwrap()
-            }
-            12 if mode != "status-without-feedback" || n < 40 => statuses
+            8 if !stop_feedback || n < 40 => statuses.send(&status(32, &[2])).unwrap(),
+            10 if mode != "missing-gravity" && (!stop_feedback || n < 40) => statuses
+                .send(&status(
+                    33,
+                    &[
+                        0,
+                        1,
+                        1,
+                        if mode == "gravity-off" { 0 } else { 1 },
+                        30000,
+                        1000,
+                        1,
+                        100,
+                        1,
+                    ],
+                ))
+                .unwrap(),
+            12 if !stop_feedback || n < 40 => statuses
                 .send(&status(
                     34,
                     &[
@@ -89,7 +89,7 @@ fn fake_native_process() {
         for i in 50..57 {
             b[i * 4..i * 4 + 4].copy_from_slice(&2f32.to_ne_bytes());
         }
-        if mode != "status-without-feedback" || n < 40 {
+        if !stop_feedback || n < 40 {
             states.send(&b).unwrap();
         }
         if mode == "status-without-feedback" && n == 50 {
@@ -97,6 +97,17 @@ fn fake_native_process() {
         }
         if mode == "status-without-feedback" && n == 52 {
             statuses.send(&status(34, &[1, 1])).unwrap();
+        }
+        if mode == "coalesced-feedback-gaps" && n >= 50 {
+            if let Ok(request) = fs::read_to_string(dir.join("feedback-gap-status")) {
+                let values: Vec<i32> = request
+                    .split_whitespace()
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                // Repeat like native cumulative status so fixture scheduling
+                // cannot make the observation depend on one queued datagram.
+                statuses.send(&status(34, &values)).unwrap();
+            }
         }
         if let Some(b) = direct.recv().unwrap() {
             assert_eq!(b.len(), 252);
@@ -238,6 +249,54 @@ fn lifecycle_transitions_are_visible_without_new_feedback_and_receipt_is_ipc_onl
             .is_err()
     );
     fixture.dead();
+}
+#[test]
+fn cumulative_feedback_gaps_preserve_missing_lifecycle_edges_without_new_feedback() {
+    for first_gaps in [1, 2] {
+        let fixture = Fixture::new("gap-history", "coalesced-feedback-gaps");
+        let mut session = ArmSession::new();
+        let arm = session.add_follower(fixture.config.clone()).unwrap();
+        session
+            .connect_followers(|a| a.connect_inner(false))
+            .unwrap();
+        let observe = |gaps, holding| {
+            // Rename keeps the fixture from observing a partially written
+            // request. This file belongs only to the test's native substitute.
+            let next = fixture.dir.join("feedback-gap-status-next");
+            fs::write(&next, format!("{gaps} {}", i32::from(holding))).unwrap();
+            fs::rename(next, fixture.dir.join("feedback-gap-status")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let state = arm.latest_state().unwrap().unwrap();
+                if state.feedback_gap_count == gaps && state.feedback_hold_active == holding {
+                    break state;
+                }
+                assert!(Instant::now() < deadline, "gap status not delivered");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let held = observe(first_gaps, true);
+        // 0/false -> 1/true is contiguous; 0/false -> 2/true skips
+        // the first episode's release and the second episode's entry.
+        assert_eq!(held.lifecycle_sequence, 2 * first_gaps - 1);
+        assert!(held.lifecycle_received_mono_ns > held.received_mono_ns);
+        let released = observe(first_gaps, false);
+        assert_eq!(released.lifecycle_sequence, held.lifecycle_sequence + 1);
+        let skipped = observe(first_gaps + 1, false);
+        // An entire entered-and-released episode was unseen, including the
+        // requested 1/false -> 2/false case.
+        assert_eq!(skipped.lifecycle_sequence, released.lifecycle_sequence + 2);
+        assert_eq!(skipped.generation, held.generation);
+        assert_eq!(skipped.received_mono_ns, held.received_mono_ns);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            arm.latest_state().unwrap().unwrap().lifecycle_sequence,
+            skipped.lifecycle_sequence,
+            "repeated cumulative status must not invent transitions"
+        );
+        session.close().unwrap();
+        fixture.dead();
+    }
 }
 #[test]
 fn native_transport_handshake_hold_feedback_and_cleanup() {

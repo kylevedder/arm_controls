@@ -27,3 +27,20 @@ ZeroMQ to run the tests. No fixture or test bypass is exposed in the public API.
 This new crate is separate from any inherited native overlay in the worktree.
 Review and pin the native source/build artifact separately; this client cannot
 prove arbitrary native binaries have the strict overlay.
+
+Coherent observation telemetry uses a state-only 496-byte message: the unchanged
+252-byte raw state, a native-endian u32 version (1), and ten 24-byte records
+(f32 position, f32 velocity, u64 CLOCK_MONOTONIC receive ns, u64 motor sample ID).
+Only complete DM/ENCOS q/dq reports advance a motor ID. Re-reading a cache,
+partial ENCOS reports, and register ACKs do not create samples. Each record is
+copied under the existing native receive lock. ArmState.feedback_samples reports
+seven optional snapshots in calibrated radians and normalized gripper opening;
+velocity uses the same coordinate per second. Legacy raw state/velocity fields
+retain their prior semantics. Unsupported/malformed optional samples are absent.
+Receive time is host parse time, not the motor's sensing instant.
+
+`command_with_receipt` returns the worker's monotonic time immediately after a
+successful native IPC send; it proves submission, never actuator execution.
+`lifecycle_sequence` and `lifecycle_received_mono_ns` expose changes even when no
+new state payload arrives. A sequence jump means intermediate mode/hold changes
+were not observed. The native strict safety overlay is unchanged by telemetry.

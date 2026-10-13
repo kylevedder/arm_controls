@@ -53,24 +53,28 @@ fn fake_native_process() {
                 ))
                 .unwrap(),
             4 => statuses.send(&status(1, &[])).unwrap(),
-            8 => statuses.send(&status(32, &[2])).unwrap(),
-            10 if mode != "missing-gravity" => statuses
-                .send(&status(
-                    33,
-                    &[
-                        0,
-                        1,
-                        1,
-                        if mode == "gravity-off" { 0 } else { 1 },
-                        30000,
-                        1000,
-                        1,
-                        100,
-                        1,
-                    ],
-                ))
-                .unwrap(),
-            12 => statuses
+            8 if mode != "status-without-feedback" || n < 40 => {
+                statuses.send(&status(32, &[2])).unwrap()
+            }
+            10 if mode != "missing-gravity" && (mode != "status-without-feedback" || n < 40) => {
+                statuses
+                    .send(&status(
+                        33,
+                        &[
+                            0,
+                            1,
+                            1,
+                            if mode == "gravity-off" { 0 } else { 1 },
+                            30000,
+                            1000,
+                            1,
+                            100,
+                            1,
+                        ],
+                    ))
+                    .unwrap()
+            }
+            12 if mode != "status-without-feedback" || n < 40 => statuses
                 .send(&status(
                     34,
                     &[
@@ -85,7 +89,15 @@ fn fake_native_process() {
         for i in 50..57 {
             b[i * 4..i * 4 + 4].copy_from_slice(&2f32.to_ne_bytes());
         }
-        states.send(&b).unwrap();
+        if mode != "status-without-feedback" || n < 40 {
+            states.send(&b).unwrap();
+        }
+        if mode == "status-without-feedback" && n == 50 {
+            statuses.send(&status(32, &[3])).unwrap();
+        }
+        if mode == "status-without-feedback" && n == 52 {
+            statuses.send(&status(34, &[1, 1])).unwrap();
+        }
         if let Some(b) = direct.recv().unwrap() {
             assert_eq!(b.len(), 252);
             writeln!(log, "position").unwrap();
@@ -192,6 +204,40 @@ impl Drop for Fixture {
         self.dead();
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+#[test]
+fn lifecycle_transitions_are_visible_without_new_feedback_and_receipt_is_ipc_only() {
+    let fixture = Fixture::new("status", "status-without-feedback");
+    let mut session = ArmSession::new();
+    let arm = session.add_follower(fixture.config.clone()).unwrap();
+    session
+        .connect_followers(|a| a.connect_inner(false))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let state = loop {
+        let state = arm.latest_state().unwrap().unwrap();
+        if state.mode == "direct" && state.feedback_hold_active {
+            break state;
+        }
+        assert!(Instant::now() < deadline, "status transition not delivered");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(state.lifecycle_sequence, 2);
+    assert!(state.lifecycle_received_mono_ns > state.received_mono_ns);
+    let generation = state.generation;
+    thread::sleep(Duration::from_millis(25));
+    assert_eq!(arm.latest_state().unwrap().unwrap().generation, generation);
+    let before = monotonic_ns();
+    let submitted = arm
+        .command_with_receipt(PositionCommand::new([0.; 6], 0.25).unwrap())
+        .unwrap();
+    assert!(before <= submitted && submitted <= monotonic_ns());
+    session.close().unwrap();
+    assert!(
+        arm.command_with_receipt(PositionCommand::new([0.; 6], 0.5).unwrap())
+            .is_err()
+    );
+    fixture.dead();
 }
 #[test]
 fn native_transport_handshake_hold_feedback_and_cleanup() {

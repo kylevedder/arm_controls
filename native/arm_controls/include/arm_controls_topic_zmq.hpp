@@ -5,6 +5,7 @@
 
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include <zmq.hpp>
 
@@ -70,7 +71,15 @@ class ZmqEffectorInfo {
     float param_float[30];     ///< Array of floating-point parameter values.
 };
 
+// State-only extension. Commands/leader topics retain the 252-byte ABI.
+struct ZmqJointState {
+    ZmqJointInfo raw;
+    uint32_t feedback_version = 1;
+    FeedbackSample feedback[10];
+};
 static_assert(sizeof(ZmqJointInfo) == 252, "ZmqJointInfo ABI changed");
+static_assert(offsetof(ZmqJointState, feedback) == 256, "feedback offset changed");
+static_assert(sizeof(ZmqJointState) == 496, "state telemetry ABI changed");
 static_assert(sizeof(ZmqCommand) == 88, "ZmqCommand ABI changed");
 static_assert(sizeof(ZmqDeviceInfo) == 88, "ZmqDeviceInfo ABI changed");
 

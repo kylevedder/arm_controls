@@ -553,6 +553,8 @@ ReturnCode ServoDm::parse_dm_servo_status(DriverCan::can_frame_t* p_frame, Recei
         // fresh -- otherwise transient trips would ping-pong the system in
         // and out of emergency recovery.
         p_received_servo_data[data_index].last_update_perf_ = Profile::get_time_now();
+        auto& sample = p_received_servo_data[data_index];
+        sample.feedback_.capture(sample.angle_actual_rad_, sample.speed_actual_rad_);
     }
 
     return ReturnCode::SUCCESS;
@@ -634,6 +636,8 @@ ReturnCode ServoDm::parser_encos_servo_status(DriverCan::can_frame_t* p_frame, R
             uint_to_float(((p_data[4] & 0x0F) << 8) | p_data[5], p_servo_param->tor_min_, p_servo_param->tor_max_, 12);
 
         p_received_servo_data[data_index].temperature_ = (p_data[6] - 50) / 2;
+        auto& sample = p_received_servo_data[data_index];
+        sample.feedback_.capture(sample.angle_actual_rad_, sample.speed_actual_rad_);
 
     } else if (ack_status == 2) {
         union RV_TypeConvert {

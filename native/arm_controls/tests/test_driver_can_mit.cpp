@@ -71,6 +71,66 @@ class DriverCanMitTestServoDm : public ServoDm {
     const ServoParam* servo_param() const { return p_servo_param_; }
 };
 
+TEST(CoherentFeedback, CompleteReportsOwnIdentityAndReadsDoNotManufactureSamples) {
+    CommandLineArgs cla{};
+    DriverCanMitTestDevice device(cla);
+    DriverCanMit driver(&device, cla);
+    ServoDmParam param{0.0f, 500.0f, 0.0f, 5.0f, -12.5f, 12.5f, -30.0f, 30.0f, -10.0f, 10.0f,
+                       0.2f, 0.3f, 0.1f};
+    DriverCanMitTestServoDm servo(&device, &driver, &param, 1, ServoType::ENCOS_A4310);
+    Driver::register_servo_data_index(servo.id_, servo.data_index_, &servo);
+    DriverCan::can_frame_t frame{};
+    frame.can_id = 1;
+    frame.can_dlc = 8;
+    frame.data[0] = 1 << 5; // Complete ENCOS q/dq report.
+    frame.data[1] = 0x80;
+    frame.data[3] = 0x80;
+    auto* cache = driver.received_servo_data_;
+    ASSERT_EQ(ServoDm::parser_encos_servo_status(&frame, cache, &DriverCanMit::find_data_index), ReturnCode::SUCCESS);
+    const auto sample = cache[0].feedback_;
+    EXPECT_EQ(sample.sample_id, 1);
+    EXPECT_GT(sample.received_mono_ns, 0);
+    EXPECT_FLOAT_EQ(sample.position, cache[0].angle_actual_rad_);
+    EXPECT_FLOAT_EQ(sample.velocity, cache[0].speed_actual_rad_);
+    ASSERT_EQ(driver.read_hardware_values(&servo), ReturnCode::SUCCESS);
+    EXPECT_EQ(servo.feedback_.sample_id, sample.sample_id);
+    ASSERT_EQ(driver.read_hardware_values(&servo), ReturnCode::SUCCESS);
+    EXPECT_EQ(servo.feedback_.sample_id, sample.sample_id);
+    EXPECT_EQ(servo.feedback_.received_mono_ns, sample.received_mono_ns);
+    frame.can_dlc = 3; // Config ACK changes legacy bus liveness only.
+    ASSERT_EQ(ServoDm::parser_encos_servo_status(&frame, cache, &DriverCanMit::find_data_index), ReturnCode::SUCCESS);
+    frame.can_dlc = 8;
+    frame.data[0] = 2 << 5; // Partial position report has no matching velocity.
+    ASSERT_EQ(ServoDm::parser_encos_servo_status(&frame, cache, &DriverCanMit::find_data_index), ReturnCode::SUCCESS);
+    EXPECT_EQ(cache[0].feedback_.sample_id, sample.sample_id);
+    EXPECT_EQ(cache[0].feedback_.received_mono_ns, sample.received_mono_ns);
+    EXPECT_FLOAT_EQ(cache[0].feedback_.position, sample.position);
+    ASSERT_EQ(driver.read_hardware_values(&servo), ReturnCode::SUCCESS);
+    EXPECT_EQ(servo.feedback_.sample_id, sample.sample_id);
+    EXPECT_FLOAT_EQ(servo.feedback_.position, sample.position);
+    frame.data[0] = 1 << 5;
+    ASSERT_EQ(ServoDm::parser_encos_servo_status(&frame, cache, &DriverCanMit::find_data_index), ReturnCode::SUCCESS);
+    EXPECT_EQ(cache[0].feedback_.sample_id, 2);
+    EXPECT_GE(cache[0].feedback_.received_mono_ns, sample.received_mono_ns);
+    Driver::register_servo_data_index(servo.id_, -1, nullptr);
+}
+
+TEST(CoherentFeedback, RelativeSignWrapAndGripperUnitsShareIdentity) {
+    FeedbackSample motor{1.0f, 0.8f, 123456789, 42};
+    const auto relative = motor.relative(2.0f, -1, 2.0f, false);
+    EXPECT_FLOAT_EQ(relative.position, 3.0f);
+    EXPECT_FLOAT_EQ(relative.velocity, -0.8f);
+    const auto opening = relative.normalized(1.0f, 5.0f, false);
+    EXPECT_FLOAT_EQ(opening.position, 0.5f);
+    EXPECT_FLOAT_EQ(opening.velocity, -0.2f);
+    EXPECT_EQ(opening.received_mono_ns, motor.received_mono_ns);
+    EXPECT_EQ(opening.sample_id, motor.sample_id);
+    const auto reversed = relative.normalized(1.0f, 5.0f, true);
+    EXPECT_FLOAT_EQ(reversed.position, 0.5f);
+    EXPECT_FLOAT_EQ(reversed.velocity, 0.2f);
+    EXPECT_EQ(relative.normalized(1.0f, 1.0f, false).sample_id, 0);
+}
+
 TEST(ServoPositionWrap, FreshCanMitCacheRecoversYambotOpenGripperReadingsAfterPowerCycle) {
     constexpr float kTwoPi = 6.283185307179586f;
     CommandLineArgs cla{};

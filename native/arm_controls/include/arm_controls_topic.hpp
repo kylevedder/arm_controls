@@ -102,8 +102,11 @@ enum class MsgType {
 /*!
  * @brief Single joint state data.
  */
+#include "arm_controls_feedback.hpp"
+
 class DataJoint {
    public:
+    FeedbackSample feedback_; ///< Complete per-motor sample; independent of legacy raw fields.
     float curr_pos_;    ///< Current relative position of the joint (radians).
     float curr_vel_;    ///< Current velocity of the joint (rad/s).
     float curr_tor_;    ///< Current torque of the joint (Nm).
@@ -132,8 +135,9 @@ class MsgJoints {
      *        -1 when the source has no per-joint freshness, e.g. command ingest).
      */
     void add_joint_info(float curr_pos_rel, float curr_vel, float curr_tor, float temperature, float idc_current,
-                        float frame_age_ms) {
+                        float frame_age_ms, FeedbackSample feedback = {}) {
         DataJoint data_joint;
+        data_joint.feedback_ = feedback;
         data_joint.curr_pos_ = curr_pos_rel;
         data_joint.curr_vel_ = curr_vel;
         data_joint.curr_tor_ = curr_tor;

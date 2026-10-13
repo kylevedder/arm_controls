@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -726,6 +727,8 @@ class NativeArmBackend(ArmBackend):
         return self._joint_names
 
     def _consume_state(self, payload: bytes) -> None:
+        if len(payload) == 496 and int.from_bytes(payload[252:256], sys.byteorder) == 1:
+            payload = payload[:JOINT_STRUCT.size]
         if len(payload) != JOINT_STRUCT.size:
             raise ProtocolError(f"invalid joint payload size {len(payload)}")
         assert self._config is not None and self._role is not None

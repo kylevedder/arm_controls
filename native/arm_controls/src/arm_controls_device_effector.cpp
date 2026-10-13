@@ -802,11 +802,14 @@ ReturnCode DeviceEffector::get_observation(MsgJoints& msg) {
     }
 
     for (auto& p_joint : joints_) {
-        msg.add_joint_info(get_normalized_gripper_position(p_joint.get()),
+        const float raw_position = get_normalized_gripper_position(p_joint.get());
+        const auto sample = p_joint->get_reference_servo()->get_feedback_sample().normalized(
+            p_joint->get_normalized_pos_min_relative(), p_joint->get_normalized_pos_max_relative(), open_at_min_);
+        msg.add_joint_info(raw_position,
                            p_joint->get_vel_rad_sec(), p_joint->get_tor_nm(),
                            p_joint->get_temperature(),
                            p_joint->get_idc_current(),
-                           static_cast<float>(p_joint->get_frame_age_ms()));
+                           static_cast<float>(p_joint->get_frame_age_ms()), sample);
     }
 
     return return_code;

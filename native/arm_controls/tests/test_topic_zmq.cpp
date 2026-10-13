@@ -83,6 +83,24 @@ class TopicZmqPublishBoundsTest : public testing::Test {
     TopicZmq topic_{&device_, cla_, 0, nullptr};
 };
 
+TEST(CoherentFeedbackWire, RawAbiAndReservedTailRemainExplicit) {
+    ZmqJointState state{};
+    state.raw.joint_num = 7;
+    state.raw.joint_pos[6] = 0.75f;
+    state.feedback[6] = FeedbackSample{0.75f, -0.25f, 123456789, 987};
+    EXPECT_EQ(sizeof(state.raw), 252u);
+    EXPECT_EQ(sizeof(state), 496u);
+    EXPECT_EQ(reinterpret_cast<const char*>(&state.feedback[0]) - reinterpret_cast<const char*>(&state), 256);
+    EXPECT_EQ(state.feedback_version, 1u);
+    EXPECT_FLOAT_EQ(state.feedback[6].position, state.raw.joint_pos[6]);
+    EXPECT_EQ(state.feedback[6].received_mono_ns, 123456789u);
+    // The legacy joint ABI has capacity ten; unused state records stay zero.
+    for (int i = 7; i < 10; ++i) {
+        EXPECT_EQ(state.feedback[i].sample_id, 0u);
+        EXPECT_EQ(state.feedback[i].received_mono_ns, 0u);
+    }
+}
+
 TEST_F(TopicZmqPublishBoundsTest, RejectsJointPayloadLargerThanWireArray) {
     MsgJoints msg;
     for (int i = 0; i < 11; ++i) {

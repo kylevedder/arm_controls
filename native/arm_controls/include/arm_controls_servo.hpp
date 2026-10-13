@@ -12,6 +12,7 @@
 #include "arm_controls_device.hpp"
 #include "arm_controls_driver.hpp"
 #include "arm_controls_hold_checker.hpp"
+#include "arm_controls_feedback.hpp"
 #include "arm_controls_profile.hpp"
 #include "arm_controls_safe_mode.hpp"
 
@@ -83,6 +84,7 @@ class Servo {
     float pos_max_rel_;                                       ///< Maximum position limit in relative radian.
     bool pos_min_configured_ = false;                         ///< Whether pos_min was loaded from any configuration file.
     bool pos_max_configured_ = false;                         ///< Whether pos_max was loaded from any configuration file.
+    FeedbackSample feedback_;                                 ///< Same locked receive snapshot as its own q/dq.
     float curr_pos_abs_ = 0;                                  ///< Current position in absolute radian (raw servo value).
     float curr_vel_ = 0;                                      ///< Current velocity in rad/sec.
     float curr_tor_ = 0;                                      ///< Current torque in Nm.
@@ -322,6 +324,10 @@ class Servo {
      * @return Current velocity in rad/sec.
      */
     virtual float get_vel_rad_sec() { return curr_vel_; }
+
+    FeedbackSample get_feedback_sample() const {
+        return feedback_.relative(zero_pos_abs_, dir_invert_, position_wrap_offset_rel_, abs_position_);
+    }
 
     /*!
      * @brief Gets the servo's current torque.

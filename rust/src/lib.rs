@@ -191,6 +191,15 @@ impl PositionCommand {
         Ok(())
     }
 }
+/// One complete motor report. Position and velocity share sample identity/time.
+/// First six coordinates use radians, final coordinate normalized opening.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackSample {
+    pub position: f64,
+    pub velocity: f64,
+    pub received_mono_ns: u64,
+    pub sample_id: u64,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArmState {
     pub positions: [f64; 7],
@@ -199,6 +208,12 @@ pub struct ArmState {
     pub temperature: [f64; 7],
     pub current: [f64; 7],
     pub frame_age_ms: [f64; 7],
+    #[serde(default)]
+    pub feedback_samples: [Option<FeedbackSample>; 7],
+    #[serde(default)]
+    pub lifecycle_sequence: u64,
+    #[serde(default)]
+    pub lifecycle_received_mono_ns: u64,
     pub received_mono_ns: u64,
     pub received_epoch_ns: u64,
     pub mode: String,
@@ -227,7 +242,7 @@ type Shared = Arc<(Mutex<Snapshot>, Condvar)>;
 enum Request {
     Position(
         PositionCommand,
-        mpsc::Sender<std::result::Result<(), String>>,
+        mpsc::Sender<std::result::Result<u64, String>>,
     ),
     Hold(mpsc::Sender<std::result::Result<(), String>>),
     Close(mpsc::Sender<std::result::Result<(), String>>),
@@ -369,10 +384,10 @@ impl FollowerArm {
             s = shared.1.wait_timeout(s, wait).unwrap().0;
         }
     }
-    fn request(
+    fn request<T>(
         &self,
-        make: impl FnOnce(mpsc::Sender<std::result::Result<(), String>>) -> Request,
-    ) -> Result<()> {
+        make: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> Request,
+    ) -> Result<T> {
         let g = self.worker.lock().unwrap();
         let w = g.as_ref().ok_or_else(|| err("not connected"))?;
         let (tx, rx) = mpsc::channel();
@@ -383,6 +398,11 @@ impl FollowerArm {
             .map_err(err)
     }
     pub fn command(&self, c: PositionCommand) -> Result<()> {
+        self.command_with_receipt(c).map(|_| ())
+    }
+    /// Returns CLOCK_MONOTONIC ns immediately after successful native IPC send.
+    /// This is submission evidence, never acknowledgement of motor execution.
+    pub fn command_with_receipt(&self, c: PositionCommand) -> Result<u64> {
         c.validate()?;
         self.request(|reply| Request::Position(c, reply))
     }
@@ -627,6 +647,8 @@ fn run(
     let mut closing = false;
     let mut terminal: Option<String> = None;
     let mut mode = "hold".to_string();
+    let mut lifecycle_sequence = 0u64;
+    let mut lifecycle_received_mono_ns = 0u64;
     loop {
         if let Ok(fault) = logrx.try_recv() {
             terminal = Some(fault);
@@ -680,10 +702,15 @@ fn run(
                         "closed",
                     ];
                     let index = *ints.first().ok_or_else(|| err("missing native mode"))?;
-                    mode = modes
+                    let next_mode = modes
                         .get(index as usize)
                         .ok_or_else(|| err("invalid native mode"))?
                         .to_string();
+                    if next_mode != mode {
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                        lifecycle_received_mono_ns = monotonic_ns();
+                        mode = next_mode;
+                    }
                     if index == 7 {
                         terminal = Some("native terminal recovery mode".into());
                     }
@@ -695,6 +722,10 @@ fn run(
                         || !matches!(ints[1], 0 | 1)
                     {
                         return Err(err("invalid feedback-gap status"));
+                    }
+                    if gaps != ints[0] as u64 || holding != (ints[1] != 0) {
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                        lifecycle_received_mono_ns = monotonic_ns();
                     }
                     gaps = ints[0] as u64;
                     holding = ints[1] != 0;
@@ -724,11 +755,32 @@ fn run(
                 None => break,
             }
         }
-        if let Some(b) = latest {
+        let latest_sample = if let Some(b) = latest {
             generation += 1;
-            let mut sample = protocol::state(&b, monotonic_ns(), generation, gaps, holding)?;
-            sample.mode = mode.clone();
-            shared.0.lock().unwrap().state = Some(sample);
+            Some(protocol::state(
+                &b,
+                monotonic_ns(),
+                generation,
+                gaps,
+                holding,
+            )?)
+        } else {
+            None
+        };
+        // Publish state and lifecycle metadata under one lock. Status can change
+        // without a position payload; never restamp that cached feedback.
+        {
+            let mut snapshot = shared.0.lock().unwrap();
+            if let Some(sample) = latest_sample {
+                snapshot.state = Some(sample);
+            }
+            if let Some(sample) = snapshot.state.as_mut() {
+                sample.mode = mode.clone();
+                sample.feedback_gap_count = gaps;
+                sample.feedback_hold_active = holding;
+                sample.lifecycle_sequence = lifecycle_sequence;
+                sample.lifecycle_received_mono_ns = lifecycle_received_mono_ns;
+            }
         }
         if let Some(e) = terminal.take() {
             if let Some(p) = pending.take() {
@@ -786,6 +838,7 @@ fn run(
                     let r = if s.ready && s.capabilities.is_some() {
                         direct
                             .send(&protocol::target(&c, (monotonic_ns() & 0x7fffffff) as i32)?)
+                            .map(|_| monotonic_ns())
                             .map_err(|e| e.to_string())
                     } else {
                         Err("native not ready".into())

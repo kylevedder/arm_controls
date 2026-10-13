@@ -444,7 +444,10 @@ ReturnCode TopicZmq::publish(const MsgJoints& msg) {
         return ReturnCode::NOT_INITIALIZED;
     }
     zmq::message_t follower_topic_msg(topic_state_.c_str(), topic_state_.length());
-    zmq::message_t follower_message(&zmq_msg, sizeof(zmq_msg));
+    ZmqJointState state{};
+    state.raw = zmq_msg;
+    for (int i = 0; i < dof_total; ++i) state.feedback[i] = msg.joints_[i].feedback_;
+    zmq::message_t follower_message(&state, sizeof(state));
     pub_follower_joint_.send(follower_topic_msg, zmq::send_flags::sndmore);
     pub_follower_joint_.send(follower_message, zmq::send_flags::dontwait);
 

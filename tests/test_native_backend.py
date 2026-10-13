@@ -949,6 +949,17 @@ def test_consume_state_rejects_wrong_payload_size():
     backend.close()
 
 
+def test_consume_state_accepts_versioned_coherent_extension_without_changing_raw_fields():
+    import sys
+    backend = make_consuming_backend()
+    raw = pack_state([0.1] * 6, sequence=17)
+    backend._consume_state(raw + (1).to_bytes(4, sys.byteorder) + bytes(240))
+    assert backend._state.joints.position_rad == pytest.approx([0.1] * 6)
+    with pytest.raises(ProtocolError, match="payload size"):
+        backend._consume_state(raw + (99).to_bytes(4, sys.byteorder) + bytes(240))
+    backend.close()
+
+
 def test_consume_state_rejects_too_few_joints():
     backend = make_consuming_backend()
     with pytest.raises(ProtocolError, match="expected at least 6"):

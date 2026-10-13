@@ -1338,7 +1338,8 @@ ReturnCode DeviceArm::get_observation(MsgJoints& msg) {
     for (auto& p_joint : joints_) {
         msg.add_joint_info(p_joint->get_pos_rad_relative(), p_joint->get_vel_rad_sec(), p_joint->get_tor_nm(),
                            p_joint->get_temperature(), p_joint->get_idc_current(),
-                           static_cast<float>(p_joint->get_frame_age_ms()));
+                           static_cast<float>(p_joint->get_frame_age_ms()),
+                           p_joint->get_reference_servo()->get_feedback_sample());
     }
 
     ///< @todo Assign a dedicated topic channel to effector for independent observation

@@ -10,6 +10,7 @@
 #include <set>
 
 #include "arm_controls_driver.hpp"
+#include "arm_controls_feedback.hpp"
 #include "arm_controls_driver_can.hpp"
 #include "arm_controls_profile.hpp"  // for prof_time_t
 
@@ -31,6 +32,7 @@ class ServoDm;
  */
 class ReceivedServoData {
    public:
+    FeedbackSample feedback_;          ///< Complete kinematic report only; guarded by the receive-cache lock.
     int motor_id_ = 0;                   ///< Motor/servo ID.
     float angle_actual_rad_ = 0.0f;      ///< Actual current angle in radians.
     float speed_actual_rad_ = 0.0f;      ///< Actual current angular velocity in radians per second.

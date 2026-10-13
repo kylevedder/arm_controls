@@ -128,6 +128,10 @@ CommandLineArgs::CommandLineArgs(int argc, char** argv) {
                              "To disable all safety features")(
         OPT_SAFETY_TORQUE_MODE, po::bool_switch()->default_value(false),
         "Enable sustained measured-torque protective stops")(
+        OPT_RESET_COMMUNICATION_FAULT_ON_START, po::bool_switch()->default_value(false),
+        "Explicitly clear only latched communication faults while disabled before strict startup")(
+        OPT_NO_RECOVERY_MOTION, po::bool_switch()->default_value(false),
+        "YAM strict disable-only fault/cleanup; explicitly write/read 100 ms RAM watchdog (gravity sag possible)")(
         OPT_PLANING_TYPE,
         po::value<std::string>()->default_value(OPT_PLANING_TYPE_DEFAULT),
         "Planning type of waypoint generation")(
@@ -485,8 +489,17 @@ CommandLineArgs::CommandLineArgs(int argc, char** argv) {
         exit(2);
     }
 
+    no_recovery_motion = vm[OPT_NO_RECOVERY_MOTION].as<bool>();
+    reset_communication_fault_on_start = vm[OPT_RESET_COMMUNICATION_FAULT_ON_START].as<bool>();
+    if (reset_communication_fault_on_start && !no_recovery_motion)
+        throw std::invalid_argument("reset_communication_fault_on_start requires no_recovery_motion");
+    if (no_recovery_motion && (device_model != "Yam" ||
+            (!effector_model.empty() && effector_model != "E_Yam"))) {
+        throw std::invalid_argument("no_recovery_motion requires Yam with optional E_Yam");
+    }
     if (vm.count(OPT_DONT_GO_TO_HOME_POS)) {
         dont_go_to_home_pos = vm[OPT_DONT_GO_TO_HOME_POS].as<bool>();
+        if (no_recovery_motion) dont_go_to_home_pos = true;
         ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0, "Skip home position: %s",
                 dont_go_to_home_pos ? "enabled" : "disabled");
     } else {

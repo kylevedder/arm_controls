@@ -222,6 +222,31 @@ ReturnCode Joint::init_config_individual(const json& joint_config, const DeviceC
         return ReturnCode::INVALID_PARAM;
     }
 
+    if (p_device_->get_cla().no_recovery_motion) {
+        // Commissioning envelopes must take effect before the first enable.
+        const std::pair<std::string, float*> overrides[] = {
+            {p_config->fn_joint_torq_min, &torq_min_},
+            {p_config->fn_joint_torq_max, &torq_max_},
+            {p_config->fn_joint_safe_torq_min, &safe_torq_min_},
+            {p_config->fn_joint_safe_torq_max, &safe_torq_max_},
+            {p_config->fn_joint_pos_error_margin, &pos_error_margin_},
+            {p_config->fn_joint_grip_torque_limit, &grip_torque_limit_nm_},
+            {p_config->fn_joint_normalized_pos_min, &normalized_pos_min_},
+            {p_config->fn_joint_normalized_pos_max, &normalized_pos_max_},
+        };
+        for (const auto& [name, value] : overrides) {
+            if (joint_config.contains(name) &&
+                p_config->get_field_value(joint_config, name, *value) != ReturnCode::SUCCESS)
+                return ReturnCode::INVALID_PARAM;
+        }
+        if (joint_config.contains(p_config->fn_joint_normalized_pos_min)) normalized_pos_min_configured_ = true;
+        if (joint_config.contains(p_config->fn_joint_normalized_pos_max)) normalized_pos_max_configured_ = true;
+        if (!std::isfinite(torq_min_) || !std::isfinite(torq_max_) || torq_min_ >= 0 || torq_max_ <= 0 ||
+            !std::isfinite(safe_torq_min_) || !std::isfinite(safe_torq_max_) || safe_torq_min_ >= 0 || safe_torq_max_ <= 0 ||
+            !std::isfinite(pos_error_margin_) || pos_error_margin_ <= 0 ||
+            !std::isfinite(grip_torque_limit_nm_) || grip_torque_limit_nm_ < 0) return ReturnCode::INVALID_PARAM;
+    }
+
     // Optional per-instance motion-limit overrides. The individual config
     // (effector_instance_config) may raise/lower the joint's velocity and
     // acceleration limits without a separate effector model.

@@ -24,6 +24,8 @@ DriverCan::DriverCan(Device* p_device, const CommandLineArgs& cla)
     : Driver(p_device, cla), port_name_(cla.control_port_name), sock_(-1), is_running_(false) {
     p_data_buf_ = &data_frame_;
     data_buf_size_ = sizeof(can_frame_t);
+    // Sequential strict enables must not accumulate one 100 ms RX join per motor.
+    if (cla.no_recovery_motion) receive_select_timeout_ms_ = 5;
 }
 
 DriverCan::~DriverCan() { close(); }
@@ -190,7 +192,7 @@ void DriverCan::receive_loop(const callback_t& callback) {
         // restarts reception per servo, so a 1 s timeout added up to a second
         // of dead time per enable).
         timeout.tv_sec = 0;
-        timeout.tv_usec = RECEIVE_LOOP_SELECT_TIMEOUT_MS * 1000;
+        timeout.tv_usec = receive_select_timeout_ms_ * 1000;
 
         int ret = select(sock_ + 1, &read_fds, nullptr, nullptr, &timeout);
         if (ret < 0) {

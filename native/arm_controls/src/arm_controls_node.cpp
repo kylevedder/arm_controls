@@ -24,8 +24,6 @@
 #include "arm_controls_exception.hpp"
 #include "arm_controls_profile.hpp"
 
-volatile std::sig_atomic_t g_terminate_signal_received = 0;
-
 void arm_controls_signal_handler(int signum) {
     g_terminate_signal_received = signum;
 }
@@ -118,6 +116,7 @@ int main(int argc, char** argv) {
     // blocks).
     std::unique_ptr<Device> p_device;
     ParentLivenessMonitor parent_liveness_monitor;
+    bool strict_exit_failure = false;
 
     try {
         CommandLineArgs cla(argc, argv);
@@ -188,6 +187,7 @@ int main(int argc, char** argv) {
         return_code = p_device->verify_servos_operational();
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Pre-loop servo verification failed: error code=%d", return_code);
+            if (cla.no_recovery_motion) p_device->stop();
             return -1;
         }
 
@@ -202,9 +202,13 @@ int main(int argc, char** argv) {
         return_code = p_device->arm_comm_loss_protection();
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Failed to arm communication-loss protection: error code=%d", return_code);
+            if (cla.no_recovery_motion) {
+                p_device->stop();
+                return -1;
+            }
         }
 
-        int capability_flags = ARM_CONTROLS_CAP_MOVE_TO_READY;
+        int capability_flags = cla.no_recovery_motion ? ARM_CONTROLS_CAP_NO_RECOVERY_MOTION : ARM_CONTROLS_CAP_MOVE_TO_READY;
         if (cla.role == Role::FOLLOWER) {
             capability_flags |= ARM_CONTROLS_CAP_DIRECT_COMMAND | ARM_CONTROLS_CAP_LIVE_INPUT;
         } else if (p_device->is_read_only()) {
@@ -224,6 +228,12 @@ int main(int argc, char** argv) {
         ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0,
                 "Starting main control loop...");
 
+        // Strict callers must prove continued liveness even if the first PUB/SUB
+        // heartbeat is lost (or no client ever sends one). Start the finite
+        // deadline now; later heartbeats refresh it. Legacy opt-in arming stays
+        // unchanged for clients that do not implement heartbeat messages.
+        if (cla.no_recovery_motion) p_device->note_client_heartbeat();
+
         bool informed_ready_now = false;
         // ZMQ PUB/SUB can drop early messages until subscribers finish
         // connecting ("slow joiner"). To make readiness robust, re-publish
@@ -239,6 +249,7 @@ int main(int argc, char** argv) {
         while (g_terminate_signal_received == 0 && p_device->is_running()) {
             return_code = p_device->step();
             if (return_code != ReturnCode::SUCCESS) {
+                if (cla.no_recovery_motion) strict_exit_failure = true;
                 if (return_code == ReturnCode::HARDWARE_FAULT) {
                     ARM_CONTROLS_ERROR("Protective stop: servo reported a hardware fault; "
                              "see preceding HARDWARE FAULT message");
@@ -290,6 +301,7 @@ int main(int argc, char** argv) {
                     // specific failed joint instead of showing "joint -1".
                     const int failed_joint_id = p_device->last_failed_joint_id();
                     p_device->enter_emergency_recovery(return_code, failed_joint_id);
+                    if (cla.no_recovery_motion) break;
                     // Continue stepping; do NOT break.
                 } else {
                     // We already entered recovery and this iteration still failed. That is expected
@@ -370,8 +382,12 @@ int main(int argc, char** argv) {
             p_device->sleep();
         }
 
+        // A client-heartbeat fault can stop the topic inside a successful step.
+        // It must remain an unsuccessful exit even if its status message is lost.
+        if (cla.no_recovery_motion && p_device->is_in_emergency_recovery()) strict_exit_failure = true;
         const std::sig_atomic_t terminate_signal = g_terminate_signal_received;
         if (terminate_signal != 0) {
+            if (cla.no_recovery_motion) strict_exit_failure = true;
             ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0,
                     "Signal handler called with signal: %d",
                     static_cast<int>(terminate_signal));
@@ -382,7 +398,8 @@ int main(int argc, char** argv) {
 
         if (p_device) {
             ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0, "Stopping device...");
-            p_device->stop();
+            const auto stop_rc = p_device->stop();
+            if (cla.no_recovery_motion && stop_rc != ReturnCode::SUCCESS) strict_exit_failure = true;
             p_device.reset();
         }
         ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0, "Device stopped");
@@ -445,5 +462,5 @@ int main(int argc, char** argv) {
     ARM_CONTROLS_INFO("main()", InfoLevel::ESSENTIAL_0,
             "arm_controls_node terminated successfully");
 
-    return 0;
+    return strict_exit_failure ? 1 : 0;
 }

@@ -73,6 +73,34 @@ class DriverCanMit : public DriverCan {
      * @brief Destructor.
      */
     ~DriverCanMit();
+    bool strict_policy() const { return strict_policy_; }
+    bool strict_retired() const { return strict_retired_.load(); }
+    void retire_strict_output(int motor_id = -1, int status = -1, int mos_temp = -1, int rotor_temp = -1);
+    ReturnCode strict_disable_all();
+    bool strict_watchdog_verified(int id) const { return strict_watchdogs_.count(id) != 0; }
+
+   private:
+    bool strict_policy_ = false;
+    std::atomic<bool> strict_retired_{false};
+    bool strict_disable_sent_ = false;  // guarded by strict_disable_mutex_
+    ReturnCode strict_disable_result_ = ReturnCode::SUCCESS;
+    std::mutex strict_disable_mutex_;
+    std::atomic<int> strict_fault_motor_id_{-1};
+    int strict_fault_status_ = -1;  // published before strict_retired_
+    int strict_fault_mos_temp_ = -1;
+    int strict_fault_rotor_temp_ = -1;
+    std::mutex strict_output_mutex_;
+    prof_time_t strict_first_enable_{};  // guarded by strict_output_mutex_
+    int strict_first_enable_id_ = -1;
+    bool strict_startup_complete_ = false;
+    bool strict_output_allowed_locked();
+    std::set<int> strict_watchdogs_;
+    ReturnCode prepare_strict_watchdogs();
+    ReturnCode reset_startup_communication_faults();
+    ReturnCode strict_enable(int id, int type);
+    ReturnCode strict_read_register(int id, uint8_t reg, uint32_t& value);
+
+   public:
 
     /*!
      * @brief Opens the CAN control port and starts message reception.
@@ -115,6 +143,7 @@ class DriverCanMit : public DriverCan {
      *         within the threshold; ``FAIL`` otherwise.
      */
     ReturnCode group_read_hardware_values() override;
+    bool feedback_gap_active() const override { return feedback_gap_active_; }
 
     /*!
      * @brief Lowest stale servo id from the most recent
@@ -122,7 +151,10 @@ class DriverCanMit : public DriverCan {
      *        responded. Surfaced to ``DeviceArm`` so the log can report a
      *        single id.
      */
-    int last_failed_servo_id() const override { return last_failed_servo_id_; }
+    int last_failed_servo_id() const override {
+        return strict_policy_ && strict_retired() && strict_fault_motor_id_.load() >= 0
+            ? strict_fault_motor_id_.load() : last_failed_servo_id_;
+    }
 
     /*!
      * @brief Set of servo ids currently considered dead (no frame within
@@ -395,6 +427,7 @@ class DriverCanMit : public DriverCan {
      *        ``group_read_hardware_values()`` call. Main-thread only.
      */
     std::set<int> dead_servo_ids_;
+    bool feedback_gap_active_ = false;
 
     /*!
      * @brief Lowest stale servo id from the most recent

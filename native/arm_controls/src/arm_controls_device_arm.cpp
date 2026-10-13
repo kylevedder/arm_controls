@@ -162,10 +162,13 @@ ReturnCode DeviceArm::publish_next_servo_param() {
     if (joints_.empty()) {
         return ReturnCode::SUCCESS;
     }
-    const int index = servo_param_publish_index_ % (int)joints_.size();
-    servo_param_publish_index_ = (index + 1) % (int)joints_.size();
+    const int count = (int)joints_.size() + (cla_.no_recovery_motion && p_effector_ ? 1 : 0);
+    const int index = servo_param_publish_index_ % count;
+    servo_param_publish_index_ = (index + 1) % count;
     Servo::MitCodecReport report;
-    if (!joints_[index]->get_mit_codec_report(report)) {
+    auto* effector = dynamic_cast<DeviceEffector*>(p_effector_.get());
+    if (!(index < (int)joints_.size() ? joints_[index]->get_mit_codec_report(report)
+                                    : effector && effector->strict_servo_report(report))) {
         return ReturnCode::SUCCESS;
     }
     // The gravity feed-forward flag is device-level; it rides every joint's
@@ -177,10 +180,12 @@ ReturnCode DeviceArm::publish_next_servo_param() {
                              report.reported_tor_valid ? 1 : 0,
                              follower_gravity_compensation_ ? 1 : 0,
                              (int)std::lround(report.pos_kp * 1000.0f),
-                             (int)std::lround(report.pos_kd * 1000.0f)};
+                             (int)std::lround(report.pos_kd * 1000.0f),
+                             report.no_recovery_motion ? 1 : 0,
+                             report.watchdog_timeout_ms, report.watchdog_verified ? 1 : 0};
     std::vector<float> floats = {report.codec_vel_min,    report.codec_vel_max,    report.codec_tor_min,
                                  report.codec_tor_max,    report.reported_spd_min, report.reported_spd_max,
-                                 report.reported_tor_min, report.reported_tor_max, report.torq_rescale};
+                                 report.reported_tor_min, report.reported_tor_max, report.torq_rescale, report.max_torque_nm};
     return publish_device_info(DEVICE_INFO_SERVO_PARAM, &floats, &ints);
 }
 
@@ -191,7 +196,16 @@ ReturnCode DeviceArm::runtime_hold() {
             return return_code;
         }
     }
-    return Device::runtime_hold();
+    // A pause must retire the attached gripper target as well as arm targets.
+    const ReturnCode arm_rc = Device::runtime_hold();
+    if (arm_rc != ReturnCode::SUCCESS) return arm_rc;
+    if (p_effector_) {
+        const auto rc = p_effector_->runtime_hold();
+        if (rc != ReturnCode::SUCCESS) return rc;
+    }
+    // Only an explicit HOLD with fresh feedback acknowledges a receive gap.
+    if (p_driver_ && !p_driver_->feedback_gap_active()) feedback_hold_latched_ = false;
+    return ReturnCode::SUCCESS;
 }
 
 ReturnCode DeviceArm::set_runtime_force_feedback(bool enabled, float gain) {
@@ -254,6 +268,7 @@ void DeviceArm::reset_slew_targets_to_current() {
         p_joint->adjusted_target_pos_ = current;
         p_joint->prev_target_pos_ = current;
     }
+    std::fill(follower_reference_velocities_.begin(), follower_reference_velocities_.end(), 0.0f);
     follower_slew_last_time_ = std::chrono::steady_clock::now();
 }
 
@@ -328,7 +343,7 @@ ReturnCode DeviceArm::read_hardware_values() {
     // Treat the pre-ready startup phase as a "partial failure tolerated" mode too: if a
     // single joint loses CAN during the very first read, we want to mark it failed and let
     // the rest of the arm reach ready instead of aborting the whole start path.
-    const bool tolerate_partial_failure = in_recovery || (is_ready_ == false);
+    const bool tolerate_partial_failure = !cla_.no_recovery_motion && (in_recovery || (is_ready_ == false));
 
     if (is_driver_created_by_this_) {
         if (p_driver_ == nullptr) {
@@ -532,7 +547,7 @@ ReturnCode DeviceArm::read_hardware_values() {
     // notification carries the real failed_joint_id. During startup (is_ready_ == false) we
     // already marked dead servos failed above and let the rest continue toward ready, so we
     // intentionally swallow the bulk-read error here.
-    if (group_return_code != ReturnCode::SUCCESS && is_ready_ == true) {
+    if (group_return_code != ReturnCode::SUCCESS && (is_ready_ || cla_.no_recovery_motion)) {
         return group_return_code;
     }
 
@@ -542,6 +557,24 @@ ReturnCode DeviceArm::read_hardware_values() {
         return soft_escalation_code;
     }
 
+    if (cla_.no_recovery_motion && is_ready_ && p_driver_) {
+        if (p_driver_->feedback_gap_active() && !feedback_hold_latched_) {
+            const auto hold_rc = runtime_hold();
+            if (hold_rc != ReturnCode::SUCCESS) return hold_rc;
+            feedback_hold_latched_ = true;
+            ++feedback_gap_count_;
+            feedback_gap_publish_tick_ = 9;
+            ARM_CONTROLS_WARN("Feedback gap %d: holding measured pose; fresh feedback and explicit HOLD required", feedback_gap_count_);
+        }
+        // Repeat the monotonic event counter so a slow/late subscriber cannot
+        // miss the pause merely because the CAN stream recovered meanwhile.
+        if (feedback_gap_count_ && ++feedback_gap_publish_tick_ >= 10) {
+            feedback_gap_publish_tick_ = 0;
+            std::vector<int> data = {feedback_gap_count_, feedback_hold_latched_ ? 1 : 0};
+            const auto rc = publish_device_info(DEVICE_INFO_FEEDBACK_GAP, nullptr, &data);
+            if (rc != ReturnCode::SUCCESS) return rc;
+        }
+    }
     return return_code;
 }
 
@@ -838,6 +871,7 @@ ReturnCode DeviceArm::init(const CommandLineArgs& cla, int argc, char** argv, st
     target_tor_.resize(dof_total_, 0.0f);
     current_motor_positions_.resize(dof_total_, 0.0f);
     slew_goal_positions_.resize(dof_, 0.0f);
+    follower_reference_velocities_.resize(dof_, 0.0f);
     ARM_CONTROLS_INFO("DeviceArm", InfoLevel::HELPFUL_1, "DeviceArm %s_%s: SERVO_NUM_TOTAL=%d", model_.c_str(), id_.c_str(),
             servo_num_total_);
 
@@ -1056,6 +1090,7 @@ ReturnCode DeviceArm::start(int baud_rate) {
             }
             ReturnCode verify_rc = p_joint->verify_position_fresh();
             if (verify_rc != ReturnCode::SUCCESS) {
+                if (cla_.no_recovery_motion) return fail_after_partial_start(verify_rc);
                 ARM_CONTROLS_WARN("%s_%s: joint id=%d cache stale after enable; marking failed and "
                         "skipping startup hold-at-current",
                         model_.c_str(), id_.c_str(), p_joint->id_);
@@ -1068,6 +1103,7 @@ ReturnCode DeviceArm::start(int baud_rate) {
             }
             ReturnCode hold_rc = p_joint->hold_at_current_position();
             if (hold_rc != ReturnCode::SUCCESS) {
+                if (cla_.no_recovery_motion) return fail_after_partial_start(hold_rc);
                 ARM_CONTROLS_WARN("%s_%s: joint id=%d hold-at-current failed (rc=%d); marking failed",
                         model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(hold_rc));
                 if (sid >= 0) {
@@ -1170,7 +1206,7 @@ ReturnCode DeviceArm::step() {
     // ARM_CONTROLS_ERROR("Failed to read hardware values") each iteration -- both spamming the UI log
     // and preventing the arm's own recovery state machine from ever advancing to MOVING_SLOW.
     // The arm's slow ready move is the only motion we want to attempt at this point.
-    if (p_effector_ && !in_recovery) {
+    if (p_effector_ && !in_recovery && (!cla_.no_recovery_motion || is_running())) {
         return_code = p_effector_->step();
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Effector step() failed for %s_%s", model_.c_str(), id_.c_str());
@@ -1241,12 +1277,37 @@ ReturnCode DeviceArm::process_follower_msg(const MsgJoints& msg_joints) {
 }
 
 ReturnCode DeviceArm::apply_action(const MsgJoints& msg) {
+    // Ignore queued motion during a receive pause. Never replay it on recovery.
+    if (feedback_hold_latched_) return ReturnCode::SUCCESS;
     ReturnCode return_code = ReturnCode::SUCCESS;
 
     if (msg.joints_.size() != static_cast<size_t>(dof_total_)) {
         ARM_CONTROLS_ERROR("Joint count mismatch in %s_%s: arm joints=%d, message joints=%d",
                  model_.c_str(), id_.c_str(), dof_total_, (int)msg.joints_.size());
         return ReturnCode::INVALID_PARAM;
+    }
+
+    if (cla_.no_recovery_motion) {
+        // Validate the entire requested vector before mutating buffers or
+        // slewing an invalid distant target into temporarily in-range motion.
+        for (size_t j = 0; j < joints_.size(); ++j) {
+            const auto& command = msg.joints_[j];
+            if (!std::isfinite(command.curr_pos_) || !std::isfinite(command.curr_vel_) ||
+                !std::isfinite(command.curr_tor_) || command.curr_pos_ < joints_[j]->get_pos_min_relative() ||
+                command.curr_pos_ > joints_[j]->get_pos_max_relative()) {
+                const int id = joints_[j]->reference_servo_id();
+                set_last_failed_joint_id(id);
+                enter_emergency_recovery(ReturnCode::SAFE_MODE_POS_EXCEED, id);
+                return ReturnCode::SAFE_MODE_POS_EXCEED;
+            }
+        }
+        for (size_t j = joints_.size(); j < msg.joints_.size(); ++j) {
+            const auto& command = msg.joints_[j];
+            if (!std::isfinite(command.curr_pos_) || command.curr_pos_ < 0.0f || command.curr_pos_ > 1.0f) {
+                enter_emergency_recovery(ReturnCode::SAFE_MODE_POS_EXCEED, -1);
+                return ReturnCode::SAFE_MODE_POS_EXCEED;
+            }
+        }
     }
 
     int i = 0;
@@ -1861,6 +1922,10 @@ ReturnCode DeviceArm::operate_as_follower() {
         for (auto& p_joint : joints_) {
             const float drift = p_joint->get_pos_rad_relative() - gravity_float_baseline_[i];
             if (std::fabs(drift) > gravity_float_abort_rad_) {
+                if (cla_.no_recovery_motion) {
+                    enter_emergency_recovery(ReturnCode::SAFE_MODE_POS_BEHIND, p_joint->reference_servo_id());
+                    return ReturnCode::SAFE_MODE_POS_BEHIND;
+                }
                 ARM_CONTROLS_INFO("DeviceArm", InfoLevel::ESSENTIAL_0,
                         "%s_%s: gravity float runaway (joint %d drifted %.3f rad > %.3f) -- re-engaging HOLD "
                         "at the current pose",
@@ -1912,7 +1977,8 @@ ReturnCode DeviceArm::operate_as_follower() {
     // command staircase was traversed as stiff instantaneous steps and
     // follow_vel_max was silently ignored. One shared scale keeps the
     // multi-joint motion synchronized (straight line in joint space).
-    if (slew_goal_positions_.size() != joints_.size() || control_frequency_ <= 0) {
+    if (slew_goal_positions_.size() != joints_.size() ||
+        follower_reference_velocities_.size() != joints_.size() || control_frequency_ <= 0) {
         ARM_CONTROLS_ERROR("Invalid synchronized slew state in operate_as_follower() for %s_%s", model_.c_str(),
                  id_.c_str());
         return ReturnCode::NOT_INITIALIZED;
@@ -1945,7 +2011,17 @@ ReturnCode DeviceArm::operate_as_follower() {
     for (auto& p_joint : joints_) {
         const float previous = p_joint->prev_target_pos_;
         const float cmd = previous + slew_scale * (slew_goal_positions_[i] - previous);
-        return_code = move(p_joint.get(), cmd, target_tor_[i], 1.0);
+        // Differentiate the bounded reference, never the raw incoming goal.
+        // Motor PD must damp velocity ERROR rather than fight all movement.
+        // Smooth ONLY the velocity feedforward (20 ms time constant): a
+        // 50 Hz goal stream otherwise creates large 200 Hz derivative pulses.
+        // Position slew is unchanged. Static velocity decays to zero; explicit
+        // HOLD/recovery immediately clears this filter while rebasing position.
+        const float reference_vel = std::clamp((cmd - previous) / dt,
+                                               -p_joint->follow_vel_max_, p_joint->follow_vel_max_);
+        const float alpha = -std::expm1(-dt / 0.020f);
+        follower_reference_velocities_[i] += alpha * (reference_vel - follower_reference_velocities_[i]);
+        return_code = move(p_joint.get(), cmd, target_tor_[i], 1.0, follower_reference_velocities_[i]);
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Failed to move joint %d in operate_as_follower() for %s_%s",
                      p_joint->id_, model_.c_str(), id_.c_str());

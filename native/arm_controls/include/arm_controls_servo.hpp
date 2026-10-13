@@ -132,6 +132,10 @@ class Servo {
         float pos_kp = 0.0f;             ///< Effective position kp sent in position frames.
         float pos_kd = 0.0f;             ///< Position kd sent in position frames.
         float torq_rescale = 1.0f;       ///< Applied gravity-delivery torque rescale (filled by Joint).
+        bool no_recovery_motion = false;
+        bool watchdog_verified = false;
+        int watchdog_timeout_ms = 0;
+        float max_torque_nm = 0.0f;
     };
 
     /*!

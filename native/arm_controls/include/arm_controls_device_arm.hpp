@@ -206,6 +206,9 @@ class DeviceArm : public Device {
     virtual bool supports_torque_feed_forward() const { return false; }
 
    protected:
+    bool feedback_hold_latched_ = false;
+    int feedback_gap_count_ = 0;
+    int feedback_gap_publish_tick_ = 0;
     /*!
      * @brief Reads current hardware values from all joints and servos.
      */
@@ -276,6 +279,7 @@ class DeviceArm : public Device {
     std::vector<float> target_tor_;              ///< Pre-allocated target torque vector.
     std::vector<float> current_motor_positions_;  ///< Pre-allocated current motor positions vector.
     std::vector<float> slew_goal_positions_;      ///< Safe follower goals used to compute one synchronized slew scale.
+    std::vector<float> follower_reference_velocities_;  ///< Smoothed velocity feedforward, cleared on HOLD/rebase.
     std::chrono::steady_clock::time_point follower_slew_last_time_{};  ///< Previous follower slew update time.
 
     std::vector<int16_t>       joint_init_sequence_;      ///< Sequence of joint IDs for initialization.

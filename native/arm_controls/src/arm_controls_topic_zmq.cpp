@@ -228,6 +228,7 @@ static bool joint_info_count_is_valid(const ZmqJointInfo& zmq_msg, int device_do
 }
 
 ReturnCode TopicZmq::step() {
+    bool discard_motion_this_step = false;
     ReturnCode first_error = ReturnCode::SUCCESS;
     auto record_result = [&first_error](ReturnCode result) {
         if (result != ReturnCode::SUCCESS &&
@@ -298,6 +299,7 @@ ReturnCode TopicZmq::step() {
                                 for (int i = 0; i < zmq_msg->num_param_int; i++) {
                                     msg.param_int_.push_back(zmq_msg->param_int[i]);
                                 }
+                                if (msg.command_ == DEVICE_COMMAND_HOLD) discard_motion_this_step = true;
                                 const ReturnCode command_result =
                                     record_result(Topic::process_leader_msg(msg));
                                 const int request_id = msg.num_param_int_ > 0 ? msg.param_int_[0] : 0;
@@ -327,7 +329,7 @@ ReturnCode TopicZmq::step() {
         const DrainResult drain_result =
             drain_sub_to_latest(sub_joint_, topic_joint_, &latest_joint, sizeof(latest_joint));
         record_result(drain_result.first_error);
-        if (drain_result.have_payload) {
+        if (drain_result.have_payload && !discard_motion_this_step) {
             record_result(process_leader_msg_joint(&latest_joint));
         }
     }
@@ -337,7 +339,7 @@ ReturnCode TopicZmq::step() {
         const DrainResult drain_result =
             drain_sub_to_latest(sub_direct_joint_, topic_direct_command_, &latest_direct, sizeof(latest_direct));
         record_result(drain_result.first_error);
-        if (drain_result.have_payload) {
+        if (drain_result.have_payload && !discard_motion_this_step) {
             record_result(process_leader_msg_joint(&latest_direct, true));
         }
     }

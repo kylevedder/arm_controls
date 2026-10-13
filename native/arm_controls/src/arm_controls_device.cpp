@@ -635,7 +635,7 @@ Device* Device::new_device(const DeviceConfig& cfg_model, const DeviceConfig& cf
 }
 
 ReturnCode Device::move(Joint* p_joint, float target_pos, float target_tor,
-                        float safe_mode_derating) {
+                        float safe_mode_derating, float target_vel) {
     (void)safe_mode_derating;
     p_joint->adjusted_target_pos_ = target_pos;
 
@@ -651,10 +651,14 @@ ReturnCode Device::move(Joint* p_joint, float target_pos, float target_tor,
         // Servo::apply_torque rescales internally but the 3-arg move does
         // not, so the leader-validated per-joint factor is applied here.
         p_joint->target_tor_ = target_tor;
-        return_code = p_joint->move(target_pos, 0, target_tor * p_joint->torq_rescale_);
+        return_code = p_joint->move(target_pos, target_vel, target_tor * p_joint->torq_rescale_);
         p_joint->prev_target_tor_ = target_tor;
-    } else {
+    } else if (dynamic_cast<DeviceArmSerial*>(this) || dynamic_cast<DeviceEffectorSerial*>(this)) {
+        // FeeTech's three-argument move interprets torque as a torque LIMIT.
+        // Preserve its position-only API: passing zero would disable its effort.
         return_code = p_joint->move(target_pos);
+    } else {
+        return_code = p_joint->move(target_pos, target_vel, 0.0f);
     }
 
     if (return_code != ReturnCode::SUCCESS) {
@@ -700,6 +704,24 @@ ReturnCode Device::publish_device_info(int info_key, std::vector<float>* p_float
 }
 
 ReturnCode Device::enter_emergency_recovery(ReturnCode cause, int failed_joint_id) {
+    if (cla_.no_recovery_motion) {
+        {
+            std::lock_guard<std::mutex> lock(emergency_mutex_);
+            if (emergency_state_ != EmergencyRecoveryState::NONE) return ReturnCode::SUCCESS;
+            emergency_state_ = EmergencyRecoveryState::COMPLETED;
+            emergency_cause_ = static_cast<int>(cause);
+            emergency_failed_joint_id_ = failed_joint_id;
+        }
+        // No hold, homing, torque command, reset, or enable is permitted here.
+        const auto park_rc = park_safely();
+        if (park_rc != ReturnCode::SUCCESS) {
+            ARM_CONTROLS_ERROR("Strict disable-only cleanup failed (rc=%d)", static_cast<int>(park_rc));
+        }
+        std::vector<int> data{static_cast<int>(cause), failed_joint_id, static_cast<int>(park_rc)};
+        publish_device_info(DEVICE_INFO_ERROR_DETECTED, nullptr, &data);
+        if (p_topic_) p_topic_->stop();
+        return park_rc;
+    }
     int cause_int = static_cast<int>(cause);
     bool was_idle = false;
     // Only SIG (CAN disconnect / motor no-response) means we genuinely cannot
@@ -773,6 +795,10 @@ void Device::check_client_heartbeat_watchdog() {
         return;
     }
     client_watchdog_tripped_ = true;
+    if (cla_.no_recovery_motion) {
+        enter_emergency_recovery(ReturnCode::NO_RESPONSE, -1);
+        return;
+    }
     ARM_CONTROLS_ERROR("%s_%s: client heartbeat lost (%lld ms of silence); dropping to safe idle",
              model_.c_str(), id_.c_str(), static_cast<long long>(silence_ms));
     if (role_ == Role::LEADER) {

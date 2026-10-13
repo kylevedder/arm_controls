@@ -56,6 +56,12 @@ ReturnCode ServoDm::reject_if_thermal_fault_latched() const {
 
 ReturnCode ServoDm::latch_effector_thermal_fault(uint8_t status_code, const char* description, const char* action,
                                                  const char* trigger) {
+    if (p_device_->get_cla().no_recovery_motion) {
+        thermal_fault_latched_ = true;
+        parked_ = true;
+        if (p_driver_can_) p_driver_can_->strict_disable_all();
+        return ReturnCode::HARDWARE_FAULT;
+    }
     if (thermal_fault_latched_) {
         return ReturnCode::HARDWARE_FAULT;
     }
@@ -93,6 +99,10 @@ ReturnCode ServoDm::latch_effector_thermal_fault(uint8_t status_code, const char
 }
 
 ReturnCode ServoDm::park_safely() {
+    if (p_device_->get_cla().no_recovery_motion) {
+        parked_ = true;
+        return p_driver_can_ ? p_driver_can_->strict_disable_all() : ReturnCode::NOT_INITIALIZED;
+    }
     if (parked_ == true) {
         return ReturnCode::SUCCESS;
     }
@@ -313,6 +323,10 @@ ReturnCode ServoDm::verify_operational() {
         return ReturnCode::SUCCESS;
     }
 
+    if (p_device_->get_cla().no_recovery_motion) {
+        p_driver_can_->retire_strict_output(id_);
+        return ReturnCode::HARDWARE_FAULT;
+    }
     if (is_dm == false) {
         ARM_CONTROLS_ERROR("Servo ID %d reports error state 0x%02X after startup", id_, motor_error_code_);
         return ReturnCode::FAIL;
@@ -357,6 +371,10 @@ ReturnCode ServoDm::move(float target_pos) {
     }
 
     float clipped_pos = clipping(target_pos, pos_min_rel_, pos_max_rel_);
+    if (p_device_->get_cla().no_recovery_motion && (!std::isfinite(target_pos) || clipped_pos != target_pos)) {
+        p_driver_can_->retire_strict_output(id_);
+        return ReturnCode::SAFE_MODE_POS_EXCEED;
+    }
     float pos_absolute = get_pos_rad_absolute(clipped_pos);
 
     float new_kp = 0.0f;
@@ -388,6 +406,10 @@ ReturnCode ServoDm::move(float target_pos, float target_vel, float target_tor) {
     // `target_pos != 0.0` guard silently turned such frames into torque-only
     // commands -- callers that want a torque-only frame use apply_torque().
     float clipped_pos = clipping(target_pos, pos_min_rel_, pos_max_rel_);
+    if (p_device_->get_cla().no_recovery_motion && (!std::isfinite(target_pos) || clipped_pos != target_pos)) {
+        p_driver_can_->retire_strict_output(id_);
+        return ReturnCode::SAFE_MODE_POS_EXCEED;
+    }
     float pos_absolute = get_pos_rad_absolute(clipped_pos);
     float pos_kp = 0.0;
 
@@ -400,7 +422,8 @@ ReturnCode ServoDm::move(float target_pos, float target_vel, float target_tor) {
     float clipped_tor = clipping(target_tor, p_joint_->torq_min_, p_joint_->torq_max_);
 
     ReturnCode return_code =
-        p_driver_can_->send_command(this, pos_kp, get_adjusted_pos_kd(), pos_absolute, target_vel, clipped_tor);
+        p_driver_can_->send_command(this, pos_kp, get_adjusted_pos_kd(), pos_absolute,
+                                    target_vel * dir_invert_, clipped_tor);
     ARM_CONTROLS_INFO("Servo", InfoLevel::FREQUENT_3,
             "Servo ID %d: Move with position=%.3f rad, velocity=%.3f rad/s, torque=%.3f Nm, pos_kp=%.3f, pos_kd=%.3f",
             id_, pos_absolute, target_vel, clipped_tor, pos_kp, pos_kd_);
@@ -488,7 +511,11 @@ ReturnCode ServoDm::parse_dm_servo_status(DriverCan::can_frame_t* p_frame, Recei
         return ReturnCode::INVALID_PARAM;
     }
 
-    if (p_data[2] == DM_CMD_WRITE) {
+    // Register ACKs start with a little-endian motor ID; telemetry starts
+    // with status<<4 | motor ID. Byte2 alone is the position low byte and
+    // equals0x55 at perfectly valid poses. Dropping it made stationary motors
+    // at those encoder bins falsely look disconnected.
+    if (p_data[0] == motor_id && p_data[1] == 0 && p_data[2] == DM_CMD_WRITE) {
         return ReturnCode::SUCCESS;
     } else {
         auto registered_servo = Driver::lock_registered_servo(motor_id);
@@ -516,7 +543,8 @@ ReturnCode ServoDm::parse_dm_servo_status(DriverCan::can_frame_t* p_frame, Recei
         p_received_servo_data[data_index].current_actual_float_ =
             uint_to_float(((p_data[4] & 0x0F) << 8) | p_data[5], p_servo_param->tor_min_, p_servo_param->tor_max_, 12);
 
-        p_received_servo_data[data_index].temperature_ = p_data[7];
+        // Monitor the hotter of drive MOS and motor rotor sensors.
+        p_received_servo_data[data_index].temperature_ = std::max(p_data[6], p_data[7]);
 
         // Stamp the receive time for the staleness watchdog. Even when the
         // error nibble reports a non-enabled state (disabled, calibration
@@ -830,6 +858,9 @@ bool ServoDm::get_mit_codec_report(MitCodecReport& report) const {
     report.reported_tor_max = reported_tor_max_;
     report.pos_kp = get_effective_pos_kp();
     report.pos_kd = pos_kd_;
+    report.no_recovery_motion = p_device_->get_cla().no_recovery_motion;
+    report.watchdog_verified = p_driver_can_ && p_driver_can_->strict_watchdog_verified(id_);
+    report.watchdog_timeout_ms = report.watchdog_verified ? 100 : 0;
     return true;
 }
 
@@ -1078,6 +1109,10 @@ ReturnCode ServoDm::read_hardware_values() {
     }
 
     ReturnCode return_code = Servo::read_hardware_values();
+    if (p_device_->get_cla().no_recovery_motion && return_code != ReturnCode::SUCCESS) {
+        p_driver_can_->retire_strict_output(id_);
+        return return_code;
+    }
 
     if (type_ != ServoType::ENCOS_A4310 && type_ != ServoType::ARX_ENCODER) {
         const DmServoStatusInfo& status = dm_servo_status_info(motor_error_code_);

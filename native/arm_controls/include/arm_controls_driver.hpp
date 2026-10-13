@@ -66,6 +66,7 @@ class Driver {
      * @return ReturnCode::SUCCESS if successful, otherwise an error code.
      */
     virtual ReturnCode group_read_hardware_values() { return ReturnCode::SUCCESS; }
+    virtual bool feedback_gap_active() const { return false; }
 
     /*!
      * @brief Returns the lowest servo id in ``dead_servo_ids()`` (the cable-

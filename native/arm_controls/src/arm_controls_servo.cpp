@@ -534,6 +534,21 @@ ReturnCode Servo::read_hardware_values() {
         motor_params_current_estimation_, curr_tor_, curr_vel_, temperature_,
         DEFAULT_VDC, get_tor_max());
 
+    if (p_device_->get_cla().no_recovery_motion) {
+        // Strict commissioning uses immediate measured envelopes, never the
+        // legacy debounced/clipping/hold-anchor recovery behavior below.
+        const float position = get_pos_rad_relative();
+        if (!std::isfinite(position) || position < pos_min_rel_ || position > pos_max_rel_)
+            return ReturnCode::SAFE_MODE_POS_EXCEED;
+        if (!std::isfinite(curr_vel_) || fabs(curr_vel_) > p_joint_->vel_max_)
+            return ReturnCode::SAFE_MODE_VEL;
+        if (!std::isfinite(curr_tor_) || curr_tor_ < p_joint_->torq_min_ || curr_tor_ > p_joint_->torq_max_)
+            return ReturnCode::SAFE_MODE_TOR;
+        if (!std::isfinite(temperature_) || temperature_ > TEMPERATURE_THRESHOLD_FORCE_STOP)
+            return ReturnCode::SAFE_MODE_TEMPERATURE;
+        return ReturnCode::SUCCESS;
+    }
+
     // Temperature force-stop must run BEFORE position/velocity/torque checks.
     // Rationale: once a servo crosses the FORCE_STOP threshold (93 C) and starts
     // losing holding torque, gravity drags the joint past its pos_min/pos_max

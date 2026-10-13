@@ -310,6 +310,7 @@ class Joint {
             return false;
         }
         report.torq_rescale = torq_rescale_;
+        report.max_torque_nm = torq_max_;
         return true;
     }
 

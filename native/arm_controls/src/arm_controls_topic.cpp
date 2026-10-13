@@ -93,6 +93,12 @@ ReturnCode Topic::process_leader_msg(const MsgCommand& msg) {
     //                                            wants to abandon slow recovery and
     //                                            switch to a normal-speed ready move
     //                                            followed by topic shutdown.
+    if (p_device_ != nullptr && p_device_->get_cla().no_recovery_motion &&
+        (msg.command_ == DEVICE_COMMAND_MOVE_TO_READY_POS ||
+         msg.command_ == DEVICE_COMMAND_MOVE_TO_READY_AND_STOP ||
+         msg.command_ == DEVICE_COMMAND_MOVE_TO_READY_POS_AND_PAUSE_LEADER_COMMAND_LISTENING)) {
+        return ReturnCode::NOT_SUPPORTED;
+    }
     if (p_device_ != nullptr && p_device_->is_in_emergency_recovery() &&
         msg.command_ != DEVICE_COMMAND_STOP &&
         msg.command_ != DEVICE_COMMAND_MOVE_TO_READY_AND_STOP) {
@@ -116,6 +122,10 @@ ReturnCode Topic::process_leader_msg(const MsgCommand& msg) {
 
     if (msg.command_ == DEVICE_COMMAND_STOP) {
         is_running_ = false;
+        if (p_device_ != nullptr && p_device_->get_cla().no_recovery_motion) {
+            // Retire the shared arm/gripper output before acknowledging shutdown.
+            return p_device_->park_safely();
+        }
 
     } else if (msg.command_ == DEVICE_COMMAND_PAUSE_LEADER_COMMAND_LISTENING) {
         // Follower-only: ignore leader joint commands.

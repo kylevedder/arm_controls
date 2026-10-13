@@ -21,14 +21,15 @@
             "joint_id": 7,
 
 
-            "vel_max": 3.2,
+            "vel_max": 10.0,
+            "follow_vel_max": 7.5,
 
             "grip_torque_limit": 1.11,
 
             "torq_min": -7,
             "torq_max": 7,
-            "safe_torq_min": 0,
-            "safe_torq_max": 0,
+            "safe_torq_min": -1.5,
+            "safe_torq_max": 1.5,
             "torq_rescale": 1,
 
             "pos_rescale": 1,

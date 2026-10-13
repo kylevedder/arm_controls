@@ -39,6 +39,8 @@
 #define OPT_ALGO_TYPE_PINO                        "Pinocchio"        ///< Pinocchio algorithm type value.
 #define OPT_ALGO_TYPE_UNDEFINED                   "undefined"        ///< Undefined algorithm type value.
 #define OPT_DONT_GO_TO_HOME_POS                   "dont_go_to_home_pos"  ///< Skip home position flag.
+#define OPT_RESET_COMMUNICATION_FAULT_ON_START "reset_communication_fault_on_start"
+#define OPT_NO_RECOVERY_MOTION                    "no_recovery_motion"
 #define OPT_LEADER_GRAVITY_COMPENSATION           "leader_gravity_compensation"  ///< Enable leader gravity compensation.
 #define OPT_EFFECTOR_MAX_POS                      "effector_max_pos"  ///< Effector max position option (radians).
 #define OPT_EFFECTOR_MAX_POS_DEFAULT              -9999.0            ///< Default effector max position value.
@@ -136,6 +138,8 @@ class CommandLineArgs {
     std::string topic_type;               ///< Topic type.
     std::string algo_type;                ///< Algorithm type.
     bool dont_go_to_home_pos;             ///< Skip home position flag.
+    bool reset_communication_fault_on_start = false;
+    bool no_recovery_motion = false;      ///< YAM disable-only faults/cleanup, 100 ms RAM watchdog.
     bool leader_gravity_compensation = false;  ///< Enable leader gravity feedforward torque.
     float effector_max_pos;               ///< Effector max position (radians).
     float effector_min_pos;               ///< Effector min position (radians).

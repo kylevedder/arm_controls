@@ -27,6 +27,9 @@ enum class EffectorControlMode {
  */
 class DeviceEffector : public Device {
    public:
+    bool strict_servo_report(Servo::MitCodecReport& report) {
+        return !joints_.empty() && joints_.front()->get_mit_codec_report(report);
+    }
     /*!
      * @brief Constructor.
      * @param cla Command-line arguments.

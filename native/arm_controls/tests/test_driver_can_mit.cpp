@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -164,7 +165,17 @@ class SocketBackedDriverCanMit : public DriverCanMit {
     using DriverCanMit::DriverCanMit;
 
     void adopt_socket(int socket_fd) { sock_ = socket_fd; }
+    int receive_timeout_ms() const { return receive_select_timeout_ms_; }
 };
+
+TEST(StrictPolicy, ReceiveHandoffWaitIsShortWithoutChangingLegacy) {
+    CommandLineArgs cla{};
+    SocketBackedDriverCanMit legacy(nullptr, cla);
+    EXPECT_EQ(legacy.receive_timeout_ms(), RECEIVE_LOOP_SELECT_TIMEOUT_MS);
+    cla.no_recovery_motion = true;
+    SocketBackedDriverCanMit strict(nullptr, cla);
+    EXPECT_EQ(strict.receive_timeout_ms(), 5);
+}
 
 class RestartFailingDriverCanMit : public DriverCanMit {
    public:
@@ -237,6 +248,151 @@ class FailingSendDriverCanMit : public DriverCanMit {
    private:
     size_t send_count_ = 0;
 };
+
+class StrictMotorTestDevice : public DriverCanMitTestDevice {
+   public:
+    using DriverCanMitTestDevice::DriverCanMitTestDevice;
+    ReturnCode get_servo_ids(std::vector<int>& ids) override {
+        ids = {1, 2, 3, 4, 5, 6, 7};
+        return ReturnCode::SUCCESS;
+    }
+};
+
+TEST(StrictPolicy, DisableRequestRetiresAllMotorsAndPreservesFailure) {
+    CommandLineArgs cla{};
+    cla.no_recovery_motion = true;
+    StrictMotorTestDevice device(cla);
+    FailingSendDriverCanMit driver(&device, cla);
+    driver.adopt_socket(42);
+    EXPECT_EQ(driver.enable(7, static_cast<int>(ServoType::DM_4310), false), ReturnCode::BUSY);
+    EXPECT_TRUE(driver.strict_retired());
+    EXPECT_EQ(driver.send_count(), 21u);
+    EXPECT_EQ(driver.strict_disable_all(), ReturnCode::BUSY);
+    EXPECT_EQ(driver.send_count(), 21u);
+    EXPECT_EQ(driver.enable(7, static_cast<int>(ServoType::DM_4310), true), ReturnCode::HARDWARE_FAULT);
+    EXPECT_EQ(driver.send_count(), 21u);
+    driver.abandon_socket();
+}
+
+TEST(StrictPolicy, StartupDeadlineRejectsLaterEnableAndTargetsBeforeTransmit) {
+    for (bool try_enable : {true, false}) {
+        CommandLineArgs cla{};
+        cla.no_recovery_motion = true;
+        StrictMotorTestDevice device(cla);
+        FailingSendDriverCanMit driver(&device, cla);
+        driver.adopt_socket(42);
+        driver.strict_watchdogs_.insert(7);
+        driver.strict_first_enable_ = Profile::get_time_now() - std::chrono::milliseconds(120);
+        driver.strict_first_enable_id_ = 1;
+        ServoDmParam param{0.0f, 500.0f, 0.0f, 5.0f, -12.5f, 12.5f, -30.0f, 30.0f, -10.0f, 10.0f,
+                           0.2f, 0.3f, 0.1f};
+        DriverCanMitTestServoDm servo(&device, &driver, &param, 7, ServoType::DM_4310);
+        const auto rc = try_enable ? driver.enable(7, static_cast<int>(ServoType::DM_4310))
+                                  : driver.send_command(&servo, 1.0f, 0.1f, 0.0f, 0.0f, 0.0f);
+        EXPECT_EQ(rc, ReturnCode::HARDWARE_FAULT);
+        EXPECT_TRUE(driver.strict_retired());
+        EXPECT_EQ(driver.last_failed_servo_id(), 1);
+        EXPECT_EQ(driver.send_count(), 0u);
+        EXPECT_EQ(driver.arm_comm_loss_protection(), ReturnCode::HARDWARE_FAULT);
+        driver.abandon_socket();
+    }
+}
+
+class OneStrictMotorDevice : public DriverCanMitTestDevice {
+   public:
+    using DriverCanMitTestDevice::DriverCanMitTestDevice;
+    ReturnCode get_servo_ids(std::vector<int>& ids) override { ids = {7}; return ReturnCode::SUCCESS; }
+};
+class RegisterTestDriver : public DriverCanMit {
+   public:
+    using DriverCanMit::DriverCanMit;
+    can_frame_t last{};
+    uint32_t timeout = 8000;
+    bool reject_write = false;
+    int writes = 0;
+    ReturnCode send_frame(void* bytes, size_t) override {
+        last = *static_cast<can_frame_t*>(bytes);
+        if (last.data[2] == 0x55) {
+            ++writes;
+            if (!reject_write) timeout = uint32_t(last.data[4]) | uint32_t(last.data[5]) << 8 |
+                uint32_t(last.data[6]) << 16 | uint32_t(last.data[7]) << 24;
+        }
+        return ReturnCode::SUCCESS;
+    }
+    ReturnCode read_frame(void* bytes, size_t) override {
+        auto& reply = *static_cast<can_frame_t*>(bytes);
+        reply = last;
+        reply.can_id = 7;
+        reply.data[2] = 0x33;
+        auto value = reply.data[3] == uint8_t(ServoDm::RegAddr::CONTROL_MODE) ?
+            uint32_t(ServoDm::OperationMode::MIT) : timeout;
+        for (int i = 0; i < 4; ++i) reply.data[4+i] = (value >> (8*i)) & 255;
+        return ReturnCode::SUCCESS;
+    }
+};
+TEST(StrictPolicy, WatchdogWriteReadbackAndMismatchBlocksEnable) {
+    for (bool mismatch : {false, true}) {
+        CommandLineArgs cla{}; cla.no_recovery_motion = true;
+        OneStrictMotorDevice device(cla);
+        RegisterTestDriver driver(&device, cla);
+        driver.reject_write = mismatch;
+        ServoDmParam param{0.0f,500.0f,0.0f,5.0f,-12.5f,12.5f,-30.0f,30.0f,-10.0f,10.0f,0.2f,0.3f,0.1f};
+        DriverCanMitTestServoDm servo(&device,&driver,&param,7,ServoType::DM_4310);
+        Driver::register_servo_data_index(7, servo.data_index_, &servo);
+        EXPECT_EQ(driver.prepare_strict_watchdogs(), mismatch ? ReturnCode::INVALID_PARAM : ReturnCode::SUCCESS);
+        EXPECT_EQ(driver.writes, 1);
+        EXPECT_EQ(driver.strict_watchdog_verified(7), !mismatch);
+        if (mismatch) EXPECT_EQ(driver.strict_enable(7, int(ServoType::DM_4310)), ReturnCode::HARDWARE_FAULT);
+        else { EXPECT_EQ(driver.timeout, 2000u); EXPECT_EQ(driver.prepare_strict_watchdogs(), ReturnCode::SUCCESS); EXPECT_EQ(driver.writes, 1); }
+        Driver::register_servo_data_index(7, -1, nullptr);
+    }
+}
+class ResetTestDriver : public DriverCanMit {
+   public:
+    using DriverCanMit::DriverCanMit;
+    std::vector<int> statuses;
+    size_t next = 0;
+    std::vector<can_frame_t> sent;
+    ReturnCode send_frame(void* bytes, size_t) override { sent.push_back(*static_cast<can_frame_t*>(bytes)); return ReturnCode::SUCCESS; }
+    ReturnCode read_frame(void* bytes, size_t) override {
+        if (next >= statuses.size()) return ReturnCode::NO_RESPONSE;
+        auto& reply = *static_cast<can_frame_t*>(bytes); reply = {};
+        reply.can_id = 0x17; reply.can_dlc = 8; reply.data[0] = uint8_t((statuses[next++] << 4) | 7);
+        return ReturnCode::SUCCESS;
+    }
+};
+TEST(StrictPolicy, StartupResetOnlyClearsDisabledCommunicationFault) {
+    for (int fault : {0xD, 8}) {
+        CommandLineArgs cla{}; cla.no_recovery_motion = true;
+        OneStrictMotorDevice device(cla); ResetTestDriver driver(&device, cla);
+        driver.statuses = {fault,0,0};
+        EXPECT_EQ(driver.reset_startup_communication_faults(), fault == 0xD ? ReturnCode::SUCCESS : ReturnCode::HARDWARE_FAULT);
+        EXPECT_EQ(driver.sent.size(), fault == 0xD ? 3u : 1u);
+        for (const auto& frame : driver.sent) EXPECT_NE(frame.data[7], 0xFC); // Never enable.
+    }
+}
+
+TEST(StrictPolicy, PositionBoundaryNeverSilentlyClipsEvenOneUlp) {
+    for (float target : {-0.1f, 0.1f, std::nextafter(0.1f, 1.0f), std::nextafter(-0.1f, -1.0f)}) {
+        CommandLineArgs cla{};
+        cla.no_recovery_motion = true;
+        DriverCanMitTestDevice device(cla);
+        DriverCanMit driver(&device, cla);
+        ServoDmParam param{0.0f, 500.0f, 0.0f, 5.0f, -12.5f, 12.5f, -30.0f, 30.0f, -10.0f, 10.0f,
+                           0.2f, 0.3f, 0.1f};
+        DriverCanMitTestServoDm servo(&device, &driver, &param, 7, ServoType::DM_4310);
+        servo.pos_min_rel_ = -0.1f;
+        servo.pos_max_rel_ = 0.1f;
+        const auto rc = servo.move(target);
+        if (target < -0.1f || target > 0.1f) {
+            EXPECT_EQ(rc, ReturnCode::SAFE_MODE_POS_EXCEED);
+            EXPECT_TRUE(driver.strict_retired());
+        } else {
+            EXPECT_NE(rc, ReturnCode::SAFE_MODE_POS_EXCEED);
+            EXPECT_FALSE(driver.strict_retired());
+        }
+    }
+}
 
 class SetupSendFailingDriverCanMit : public DriverCanMit {
    public:

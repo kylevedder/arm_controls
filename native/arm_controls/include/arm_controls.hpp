@@ -4,6 +4,11 @@
  */
 #pragma once
 
+#include <csignal>
+
+// Signal-safe shutdown request shared with strict startup/output gates.
+inline volatile std::sig_atomic_t g_terminate_signal_received = 0;
+
 #define DEFAULT_BAUD_RATE                         3000000            ///< Default baud rate (bits per second).
 #define DEFAULT_DOF_ARM                           6                  ///< Default arm DOF.
 #define DEFAULT_SERVO_NUM_ARM                     DEFAULT_DOF_ARM    ///< Default number of servos in arm.

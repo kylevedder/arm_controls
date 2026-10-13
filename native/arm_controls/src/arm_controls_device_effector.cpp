@@ -70,6 +70,7 @@ void DeviceEffector::clear_command_buffers_for_move_to_ready() {
         if (i < (int)tele_vel_.size()) tele_vel_[i] = 0.0f;
         if (i < (int)tele_tor_.size()) tele_tor_[i] = 0.0f;
 
+        p_joint->prev_target_pos_ = current;
         p_joint->set_tele_pos_rad(current);
         p_joint->set_tele_vel_rad_sec(0.0f);
         p_joint->set_tele_tor_nm(0.0f);
@@ -211,6 +212,7 @@ ReturnCode DeviceEffector::start(int baud_rate) {
             }
             ReturnCode verify_rc = p_joint->verify_position_fresh();
             if (verify_rc != ReturnCode::SUCCESS) {
+                if (cla_.no_recovery_motion) return fail_after_partial_start(verify_rc);
                 ARM_CONTROLS_WARN("%s_%s: joint id=%d cache stale after enable; marking failed and "
                         "skipping startup hold-at-current",
                         model_.c_str(), id_.c_str(), p_joint->id_);
@@ -223,6 +225,7 @@ ReturnCode DeviceEffector::start(int baud_rate) {
             }
             ReturnCode hold_rc = p_joint->hold_at_current_position();
             if (hold_rc != ReturnCode::SUCCESS) {
+                if (cla_.no_recovery_motion) return fail_after_partial_start(hold_rc);
                 ARM_CONTROLS_WARN("%s_%s: joint id=%d hold-at-current failed (rc=%d); marking failed",
                         model_.c_str(), id_.c_str(), p_joint->id_, static_cast<int>(hold_rc));
                 if (sid >= 0) {
@@ -278,7 +281,7 @@ ReturnCode DeviceEffector::read_hardware_values() {
     // Mirror DeviceArm: tolerate partial per-joint failures both during recovery and during
     // startup (is_ready_ == false) so a single dead joint cannot block the entire arm from
     // reaching ready.
-    const bool tolerate_partial_failure = in_recovery || (is_ready_ == false);
+    const bool tolerate_partial_failure = !cla_.no_recovery_motion && (in_recovery || (is_ready_ == false));
 
     // Only call group_read_hardware_values() if no Arm is attached (Effector
     // operates alone) If Arm is attached, Arm will call it to avoid duplicate
@@ -1223,8 +1226,15 @@ ReturnCode DeviceEffector::operate_as_follower() {
             // Position mode: bound the motor-side PD demand in both directions.
             // A blocked opening stop can overheat the gripper just as a blocked
             // closing command can.
+            // Absolute goals still need a bounded native trajectory. Without
+            // this, trigger steps and network staircases bypass follow_vel_max
+            // and can trip the measured-velocity stop in ordinary operation.
+            if (control_frequency_ <= 0) return ReturnCode::NOT_INITIALIZED;
+            const float step = p_joint->follow_vel_max_ / static_cast<float>(control_frequency_);
+            const float previous = p_joint->prev_target_pos_;
+            const float goal = previous + p_joint->clipping(tele_pos_[i] - previous, -step, step);
             return_code =
-                move(p_joint.get(), p_joint->clamp_target_to_grip_torque_limit(tele_pos_[i]), 0, 1.0);
+                move(p_joint.get(), p_joint->clamp_target_to_grip_torque_limit(goal), 0, 1.0);
         }
         if (return_code != ReturnCode::SUCCESS) {
             ARM_CONTROLS_ERROR("Failed to move effector joint %d in operate_as_follower() for %s_%s",

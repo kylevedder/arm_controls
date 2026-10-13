@@ -108,6 +108,7 @@ class DriverCan : public Driver {
                                   ///< open() only sets can_family/can_ifindex, but bind() reads the whole
                                   ///< struct including the can_addr union and padding.
     std::atomic<bool> is_running_;  ///< Atomic flag indicating whether the reception thread is running.
+    int receive_select_timeout_ms_ = RECEIVE_LOOP_SELECT_TIMEOUT_MS;
     std::thread reception_thread_;  ///< Background thread that runs receive_loop().
     void* p_data_buf_;  ///< Pointer to the data buffer used for receiving CAN messages.
     size_t data_buf_size_;  ///< Size of the data buffer in bytes.

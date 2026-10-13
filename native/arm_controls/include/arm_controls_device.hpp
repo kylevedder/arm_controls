@@ -504,7 +504,8 @@ class Device {
      * @param safe_mode_derating Derating factor (0.0 to 1.0).
      * @return ReturnCode::SUCCESS if successful, otherwise an error code.
      */
-    virtual ReturnCode move(Joint* p_joint, float target_pos, float target_tor, float safe_mode_derating);
+    virtual ReturnCode move(Joint* p_joint, float target_pos, float target_tor, float safe_mode_derating,
+                            float target_vel = 0.0f);
 
     /*!
      * @brief Sets the device operation mode.
@@ -688,9 +689,9 @@ class Device {
     /*!
      * @brief Records a client-liveness heartbeat (DEVICE_COMMAND_HEARTBEAT).
      *
-     * The watchdog only arms after the first heartbeat is seen, so clients
-     * that never send heartbeats (older library versions) keep the previous
-     * behavior. Called from the lifecycle command dispatch, which runs on the
+     * Legacy mode arms only after the first heartbeat, preserving older clients.
+     * Strict mode also calls this once before its control loop so missing every
+     * heartbeat cannot bypass the deadline. Lifecycle command dispatch runs on the
      * control thread (Topic::step inside Device::step), same as the check.
      */
     void note_client_heartbeat() {

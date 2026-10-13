@@ -61,6 +61,7 @@ int dm_response_motor_id(const DriverCan::can_frame_t& frame) {
 }  // namespace
 
 DriverCanMit::DriverCanMit(Device* p_device, const CommandLineArgs& cla) : DriverCan(p_device, cla) {
+    strict_policy_ = cla.no_recovery_motion;
     // ReceivedServoData has in-class member initializers, so default
     // construction zero-fills the cache. ``last_update_perf_`` is left at
     // its default ``prof_time_t{}`` sentinel so ``Profile::is_zero``
@@ -72,8 +73,239 @@ DriverCanMit::DriverCanMit(Device* p_device, const CommandLineArgs& cla) : Drive
 
 DriverCanMit::~DriverCanMit() {}
 
+bool DriverCanMit::strict_output_allowed_locked() {
+    if (strict_retired() || g_terminate_signal_received != 0) return false;
+    if (!strict_startup_complete_ && !Profile::is_zero(strict_first_enable_) &&
+        Profile::get_time_diff(strict_first_enable_, Profile::get_time_now()) >= 80) {
+        // One shared deadline covers arm AND effector, from before the first FC
+        // until pre-loop verification. A late thread must never resume enables
+        // or target output after an earlier motor's watchdog could have expired.
+        strict_fault_motor_id_.store(strict_first_enable_id_);
+        strict_retired_.store(true);
+        ARM_CONTROLS_ERROR("Strict startup exceeded 80 ms after first enable (motor=%d); retiring output",
+                strict_first_enable_id_);
+        return false;
+    }
+    return true;
+}
+
+void DriverCanMit::retire_strict_output(int motor_id, int status, int mos_temp, int rotor_temp) {
+    std::lock_guard<std::mutex> lock(strict_output_mutex_);
+    if (strict_retired()) return;
+    strict_fault_motor_id_.store(motor_id);
+    strict_fault_status_ = status;
+    strict_fault_mos_temp_ = mos_temp;
+    strict_fault_rotor_temp_ = rotor_temp;
+    strict_retired_.store(true);
+}
+
+ReturnCode DriverCanMit::strict_disable_all() {
+    // Retire the entire shared arm/effector driver BEFORE any shutdown I/O.
+    retire_strict_output();
+    std::lock_guard<std::mutex> disable_lock(strict_disable_mutex_);
+    if (strict_disable_sent_) return strict_disable_result_;
+    strict_disable_sent_ = true;
+    if (!p_device_) return strict_disable_result_ = ReturnCode::NOT_INITIALIZED;
+    std::vector<int> ids;
+    const auto ids_rc = p_device_->get_servo_ids(ids);
+    if (ids_rc != ReturnCode::SUCCESS) return strict_disable_result_ = ids_rc;
+    ReturnCode first = ReturnCode::SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        for (int id : ids) {
+            const auto rc = send_disable_once(id, static_cast<int>(ServoType::DM_4310));
+            if (first == ReturnCode::SUCCESS && rc != ReturnCode::SUCCESS) first = rc;
+        }
+        usleep(1000);
+    }
+    return strict_disable_result_ = first;
+}
+
+ReturnCode DriverCanMit::strict_read_register(int id, uint8_t reg, uint32_t& value) {
+    if (g_terminate_signal_received != 0 || strict_retired()) return ReturnCode::HARDWARE_FAULT;
+    can_frame_t query{};
+    query.can_id = 0x7FF;
+    query.can_dlc = 8;
+    query.data[0] = id & 0xFF;
+    query.data[1] = id >> 8;
+    query.data[2] = 0x33;
+    query.data[3] = reg;
+    auto rc = send_frame(&query, sizeof(query));
+    if (rc != ReturnCode::SUCCESS) return rc;
+    for (int i = 0; i < MAX_SERVO_INFO_BUF_SIZE; ++i) {
+        can_frame_t reply{};
+        rc = read_frame(&reply, sizeof(reply));
+        if (rc != ReturnCode::SUCCESS) return rc;
+        const uint32_t reply_id = reply.can_id & 0x7FF;
+        if ((reply_id == 0 || reply_id == static_cast<uint32_t>(id + 0x10) || reply_id == static_cast<uint32_t>(id)) &&
+            reply.can_dlc == 8 && reply.data[0] == (id & 0xFF) && reply.data[1] == (id >> 8) &&
+            reply.data[2] == 0x33 && reply.data[3] == reg) {
+            value = uint32_t(reply.data[4]) | (uint32_t(reply.data[5]) << 8) |
+                    (uint32_t(reply.data[6]) << 16) | (uint32_t(reply.data[7]) << 24);
+            return ReturnCode::SUCCESS;
+        }
+    }
+    return ReturnCode::NO_RESPONSE;
+}
+
+ReturnCode DriverCanMit::reset_startup_communication_faults() {
+    // Explicit one-shot commissioning option. No receive thread or motor enable
+    // exists yet. Never clear thermal, voltage, current or overload faults.
+    std::vector<int> ids;
+    p_device_->get_servo_ids(ids);
+    auto disabled_status = [&](int id, int& status) -> ReturnCode {
+        if (g_terminate_signal_received != 0) return ReturnCode::HARDWARE_FAULT;
+        can_frame_t frame{};
+        ServoDm::can_frame_to_enable_dm_servo(frame, id, false);
+        auto rc = send_frame(&frame, sizeof(frame));
+        for (int i = 0; rc == ReturnCode::SUCCESS && i < MAX_SERVO_INFO_BUF_SIZE; ++i) {
+            can_frame_t reply{};
+            rc = read_frame(&reply, sizeof(reply));
+            if (rc != ReturnCode::SUCCESS) return rc;
+            if (dm_response_motor_id(reply) != id) continue;
+            status = reply.data[0] >> 4;
+            if (reply.data[6] > TEMPERATURE_THRESHOLD_FORCE_STOP ||
+                reply.data[7] > TEMPERATURE_THRESHOLD_FORCE_STOP) return ReturnCode::HARDWARE_FAULT;
+            return ReturnCode::SUCCESS;
+        }
+        return rc == ReturnCode::SUCCESS ? ReturnCode::NO_RESPONSE : rc;
+    };
+    for (int id : ids) {
+        int status = -1;
+        auto rc = disabled_status(id, status);
+        if (rc != ReturnCode::SUCCESS) return rc;
+        if (status == 0) continue;
+        if (status != 0xD) return ReturnCode::HARDWARE_FAULT;
+        if (g_terminate_signal_received != 0) return ReturnCode::HARDWARE_FAULT;
+        can_frame_t reset{};
+        ServoDm::can_frame_to_reset_dm_servo(reset, id);
+        rc = send_frame(&reset, sizeof(reset));
+        if (rc != ReturnCode::SUCCESS) return rc;
+        // Consume the reset response before requesting a fresh disabled status.
+        bool acknowledged = false;
+        for (int i = 0; i < MAX_SERVO_INFO_BUF_SIZE; ++i) {
+            can_frame_t reply{};
+            rc = read_frame(&reply, sizeof(reply));
+            if (rc != ReturnCode::SUCCESS) return rc;
+            if (dm_response_motor_id(reply) != id) continue;
+            if ((reply.data[0] >> 4) > 1 ||
+                reply.data[6] > TEMPERATURE_THRESHOLD_FORCE_STOP ||
+                reply.data[7] > TEMPERATURE_THRESHOLD_FORCE_STOP) return ReturnCode::HARDWARE_FAULT;
+            acknowledged = true;
+            break;
+        }
+        if (!acknowledged) return ReturnCode::NO_RESPONSE;
+        rc = disabled_status(id, status);
+        if (rc != ReturnCode::SUCCESS || status != 0) return ReturnCode::HARDWARE_FAULT;
+        ARM_CONTROLS_WARN("Explicit startup reset cleared communication fault on disabled motor %d", id);
+    }
+    return ReturnCode::SUCCESS;
+}
+
+ReturnCode DriverCanMit::prepare_strict_watchdogs() {
+    strict_watchdogs_.clear();
+    if (!p_device_) return ReturnCode::NOT_INITIALIZED;
+    std::vector<int> ids;
+    p_device_->get_servo_ids(ids);
+    for (int id : ids) {
+        auto reg = lock_registered_servo(id);
+        auto* servo = dynamic_cast<ServoDm*>(reg.get());
+        if (!servo || (servo->get_servo_type() != ServoType::DM_4310 &&
+                       servo->get_servo_type() != ServoType::DM_4340)) return ReturnCode::NOT_SUPPORTED;
+    }
+    for (int id : ids) {
+        uint32_t value = 0;
+        auto mode_rc = strict_read_register(id, static_cast<uint8_t>(ServoDm::RegAddr::CONTROL_MODE), value);
+        if (mode_rc != ReturnCode::SUCCESS) return mode_rc;
+        if (value != static_cast<uint32_t>(ServoDm::OperationMode::MIT)) return ReturnCode::INVALID_PARAM;
+        auto rc = strict_read_register(id, static_cast<uint8_t>(ServoDm::RegAddr::TIMEOUT), value);
+        if (rc != ReturnCode::SUCCESS) return rc;
+        if (value != 2000) {
+            // 2000 ticks = 100 ms. Bound stale velocity/feedforward frames even
+            // if the native control thread stalls and cannot issue HOLD.
+            // Explicit opt-in policy authorizes only this RAM watchdog write.
+            can_frame_t frame{};
+            ServoDm::can_frame_to_write_register_dm_servo(frame, id, ServoDm::RegAddr::TIMEOUT, 2000);
+            rc = send_frame(&frame, sizeof(frame));
+            if (rc != ReturnCode::SUCCESS) return rc;
+            rc = strict_read_register(id, static_cast<uint8_t>(ServoDm::RegAddr::TIMEOUT), value);
+            if (rc != ReturnCode::SUCCESS) return rc;
+        }
+        if (value != 2000) return ReturnCode::INVALID_PARAM;
+        strict_watchdogs_.insert(id);
+    }
+    return ReturnCode::SUCCESS;
+}
+
+ReturnCode DriverCanMit::strict_enable(int id, int type) {
+    if (strict_retired() || !strict_watchdog_verified(id)) return ReturnCode::HARDWARE_FAULT;
+    if (type != static_cast<int>(ServoType::DM_4310) && type != static_cast<int>(ServoType::DM_4340))
+        return ReturnCode::NOT_SUPPORTED;
+    {
+        std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+        if (!strict_output_allowed_locked()) return ReturnCode::HARDWARE_FAULT;
+    }
+    stop_reception();
+    can_frame_t frame{};
+    ServoDm::can_frame_to_enable_dm_servo(frame, id, true);
+    ReturnCode rc;
+    {
+        std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+        if (!strict_output_allowed_locked()) {
+            rc = ReturnCode::HARDWARE_FAULT;
+        } else {
+            if (Profile::is_zero(strict_first_enable_)) {
+                strict_first_enable_ = Profile::get_time_now();
+                strict_first_enable_id_ = id;
+            }
+            rc = send_frame(&frame, sizeof(frame));
+        }
+    }
+    bool acknowledged = false;
+    for (int i = 0; rc == ReturnCode::SUCCESS && i < MAX_SERVO_INFO_BUF_SIZE; ++i) {
+        {
+            std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+            if (!strict_output_allowed_locked()) { rc = ReturnCode::HARDWARE_FAULT; break; }
+        }
+        can_frame_t reply{};
+        rc = read_frame(&reply, sizeof(reply));
+        {
+            std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+            if (!strict_output_allowed_locked()) { rc = ReturnCode::HARDWARE_FAULT; break; }
+        }
+        if (rc != ReturnCode::SUCCESS) break;
+        const int replying_motor = dm_response_motor_id(reply);
+        if (replying_motor < 0) continue;
+        if ((reply.data[0] >> 4) != 1 || reply.data[6] > TEMPERATURE_THRESHOLD_FORCE_STOP ||
+            reply.data[7] > TEMPERATURE_THRESHOLD_FORCE_STOP) {
+            last_enable_fault_status_ = reply.data[0] >> 4;
+            retire_strict_output(replying_motor, last_enable_fault_status_, reply.data[6], reply.data[7]);
+            ARM_CONTROLS_ERROR("Strict startup fault: motor=%d status=0x%X MOS=%d rotor=%d",
+                    replying_motor, last_enable_fault_status_.load(), reply.data[6], reply.data[7]);
+            rc = ReturnCode::HARDWARE_FAULT;
+            break;
+        }
+        if (replying_motor != id) continue;
+        {
+            std::lock_guard<std::mutex> lock(received_servo_data_mutex_);
+            rc = ServoDm::parse_dm_servo_status(&reply, received_servo_data_, &DriverCanMit::find_data_index, this);
+        }
+        acknowledged = rc == ReturnCode::SUCCESS;
+        break;
+    }
+    if (!acknowledged) {
+        retire_strict_output(id);
+        if (rc == ReturnCode::SUCCESS) rc = ReturnCode::NO_RESPONSE;
+    }
+    auto restart = DriverCan::start_reception([this](void* data, size_t size, size_t bytes) {
+        handle_received_message(data, size, bytes);
+    });
+    return rc != ReturnCode::SUCCESS ? rc : restart;
+}
+
 ReturnCode DriverCanMit::open(int baud_rate) {
     (void)baud_rate;
+    // Retirement cannot be cleared by reopening this driver instance.
+    if (strict_policy_ && strict_retired()) return ReturnCode::HARDWARE_FAULT;
 
     ReturnCode return_code = DriverCan::open(baud_rate);
     if (return_code != ReturnCode::SUCCESS) {
@@ -86,6 +318,23 @@ ReturnCode DriverCanMit::open(int baud_rate) {
         ARM_CONTROLS_ERROR("Passive encoder startup validation failed; refusing to enable motors");
         DriverCan::close();
         return return_code;
+    }
+
+    if (strict_policy_) {
+        if (p_device_->get_cla().reset_communication_fault_on_start) {
+            return_code = reset_startup_communication_faults();
+            if (return_code != ReturnCode::SUCCESS) {
+                strict_disable_all();
+                DriverCan::close();
+                return return_code;
+            }
+        }
+        return_code = prepare_strict_watchdogs();
+        if (return_code != ReturnCode::SUCCESS) {
+            strict_disable_all();
+            DriverCan::close();
+            return return_code;
+        }
     }
 
     return_code = DriverCan::start_reception([this](void* p_data_buf, size_t data_buf_size, size_t read_bytes) {
@@ -380,12 +629,20 @@ ReturnCode DriverCanMit::close() {
 }
 
 ReturnCode DriverCanMit::group_read_hardware_values() {
+    if (strict_policy_ && (strict_retired() || g_terminate_signal_received != 0)) {
+        if (strict_retired()) {
+            ARM_CONTROLS_ERROR("Strict output retired: motor=%d status=%d MOS=%d rotor=%d",
+                    strict_fault_motor_id_.load(), strict_fault_status_, strict_fault_mos_temp_, strict_fault_rotor_temp_);
+        }
+        return ReturnCode::HARDWARE_FAULT;
+    }
     // Reset the per-cycle output. We need a CLEAN dead_servo_ids_ on every
     // call so the set always reflects the current cycle's staleness (DXL
     // keeps a sticky cache because re-pinging is expensive, but the CAN-MIT
     // path is just an O(N) timestamp compare so per-cycle is cheap and
     // simpler).
     dead_servo_ids_.clear();
+    feedback_gap_active_ = false;
     last_failed_servo_id_ = -1;
 
     if (p_device_ == nullptr) {
@@ -400,12 +657,15 @@ ReturnCode DriverCanMit::group_read_hardware_values() {
         return ReturnCode::SUCCESS;
     }
 
-    const prof_time_t now = Profile::get_time_now();
-    const prof_time_msec_t threshold_ms = any_motor_moved_
+    // A brief receive gap pauses targets at 80 ms; sustained loss retires at
+    // 300 ms. RX-only loss still receives HOLD frames; a stalled/dead native
+    // sender is independently disabled by the verified 100 ms motor watchdog.
+    const prof_time_msec_t threshold_ms = strict_policy_ ? 300 : any_motor_moved_
         ? static_cast<prof_time_msec_t>(CAN_MIT_STALE_FRAME_AGE_NORMAL_MS)
         : static_cast<prof_time_msec_t>(CAN_MIT_STALE_FRAME_AGE_INITIAL_MS);
 
     bool any_alive_this_cycle = false;
+    std::vector<std::tuple<int, long, bool>> gap_messages;
     {
         // Lock across the scan: every iteration reads a cached
         // last_update_perf_, which the CAN RX thread updates concurrently.
@@ -413,6 +673,7 @@ ReturnCode DriverCanMit::group_read_hardware_values() {
         // main-thread only, so keeping them inside the same critical section
         // is harmless.
         std::lock_guard<std::mutex> lock(received_servo_data_mutex_);
+        const prof_time_t now = Profile::get_time_now();
         for (int servo_id : servo_ids) {
             const int data_index = find_data_index(servo_id);
             if (data_index < 0 || data_index >= MAX_SERVO_INFO_BUF_SIZE) {
@@ -436,6 +697,7 @@ ReturnCode DriverCanMit::group_read_hardware_values() {
 
             any_alive_this_cycle = true;
             const prof_time_msec_t age_ms = Profile::get_time_diff(last_update, now);
+            if (strict_policy_ && age_ms > 80) feedback_gap_active_ = true;
             if (age_ms > threshold_ms) {
                 dead_servo_ids_.insert(servo_id);
             }
@@ -445,19 +707,22 @@ ReturnCode DriverCanMit::group_read_hardware_values() {
             // published position silently repeats the cached value meanwhile)
             // leave evidence in the node log. Recovery logs the gap length.
             const auto warned_it = stall_warned_since_.find(servo_id);
-            if (age_ms > static_cast<prof_time_msec_t>(CAN_MIT_STALL_WARN_AGE_MS)) {
+            if (age_ms > static_cast<prof_time_msec_t>(strict_policy_ ? 80 : CAN_MIT_STALL_WARN_AGE_MS)) {
                 if (warned_it == stall_warned_since_.end()) {
-                    ARM_CONTROLS_WARN("Servo id=%d: telemetry stalled (newest frame is %ld ms old, warn threshold=%d ms); "
-                            "publishing the cached position meanwhile",
-                            servo_id, static_cast<long>(age_ms), CAN_MIT_STALL_WARN_AGE_MS);
+                    gap_messages.emplace_back(servo_id, static_cast<long>(age_ms), true);
                     stall_warned_since_[servo_id] = last_update;
                 }
             } else if (warned_it != stall_warned_since_.end()) {
-                ARM_CONTROLS_WARN("Servo id=%d: telemetry resumed after a %ld ms gap", servo_id,
-                        static_cast<long>(Profile::get_time_diff(warned_it->second, now)));
+                gap_messages.emplace_back(servo_id, static_cast<long>(Profile::get_time_diff(warned_it->second, now)), false);
                 stall_warned_since_.erase(warned_it);
             }
         }
+    }
+
+    // Never block the receive-cache lock on log output during a gap.
+    for (const auto& [servo_id, age_ms, stalled] : gap_messages) {
+        if (stalled) ARM_CONTROLS_WARN("Servo id=%d: feedback gap age=%ld ms; holding at80ms, retiring at300ms", servo_id, age_ms);
+        else ARM_CONTROLS_WARN("Servo id=%d: telemetry resumed after a %ld ms gap", servo_id, age_ms);
     }
 
     // Transition INITIAL -> NORMAL the first time we see ANY fresh frame.
@@ -527,6 +792,12 @@ void DriverCanMit::query_and_adopt_encos_mit_ranges(int id) {
 }
 
 ReturnCode DriverCanMit::arm_comm_loss_protection() {
+    if (strict_policy_) {
+        std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+        if (!strict_output_allowed_locked()) return ReturnCode::HARDWARE_FAULT;
+        strict_startup_complete_ = true;
+        return ReturnCode::SUCCESS;
+    }
     if (!is_socket_open()) {
         ARM_CONTROLS_ERROR("CAN socket is not initialized in arm_comm_loss_protection()");
         return ReturnCode::NOT_INITIALIZED;
@@ -705,6 +976,8 @@ ReturnCode DriverCanMit::send_command(ServoDm* p_servo_dm, float kp, float kd, f
     }
 
     std::lock_guard<std::mutex> transaction_lock(transaction_mutex_);
+    std::lock_guard<std::mutex> output_lock(strict_output_mutex_);
+    if (strict_policy_ && !strict_output_allowed_locked()) return ReturnCode::HARDWARE_FAULT;
     if (is_socket_open()) {
         can_frame_t frame;
         switch ((int)p_servo_dm->get_servo_type()) {
@@ -736,7 +1009,12 @@ ReturnCode DriverCanMit::send_command(ServoDm* p_servo_dm, float kp, float kd, f
 }
 
 ReturnCode DriverCanMit::enable(int id, int type, bool enable_flag, bool defer_effector_thermal_fault) {
+    // The disable-only burst acquires the transaction lock for each frame.
+    if (strict_policy_ && !enable_flag) return strict_disable_all();
     std::lock_guard<std::mutex> transaction_lock(transaction_mutex_);
+    if (strict_policy_) {
+        return strict_enable(id, type);
+    }
     last_enable_fault_status_ = -1;
     if (is_socket_open()) {
         can_frame_t frame;
@@ -1057,6 +1335,7 @@ ReturnCode DriverCanMit::register_passive_encoder(int response_can_id, int encod
 }
 
 ReturnCode DriverCanMit::reset_zero_position(int id, int type) {
+    if (strict_policy_) return ReturnCode::NOT_SUPPORTED;
     std::lock_guard<std::mutex> transaction_lock(transaction_mutex_);
     if (is_socket_open()) {
         can_frame_t frame;
@@ -1168,6 +1447,11 @@ void DriverCanMit::handle_received_message(void* p_data_buf, size_t data_buf_siz
     }
 
     if (dm_response_motor_id(*p_frame) >= 0) {
+        if (strict_policy_ && ((p_frame->data[0] >> 4) != 1 || p_frame->data[6] > TEMPERATURE_THRESHOLD_FORCE_STOP ||
+                               p_frame->data[7] > TEMPERATURE_THRESHOLD_FORCE_STOP)) {
+            retire_strict_output(dm_response_motor_id(*p_frame), p_frame->data[0] >> 4,
+                    p_frame->data[6], p_frame->data[7]);
+        }
         return_code =
             ServoDm::parse_dm_servo_status(p_frame, received_servo_data_, &DriverCanMit::find_data_index, this);
         if (return_code != ReturnCode::SUCCESS) {

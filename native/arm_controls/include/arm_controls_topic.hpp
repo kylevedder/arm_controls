@@ -70,6 +70,7 @@
 //   param_float[4..5] = motor-reported SPD range min/max (rad/s; valid per param_int[1])
 //   param_float[6..7] = motor-reported TOR range min/max (Nm; valid per param_int[2])
 #define DEVICE_INFO_SERVO_PARAM        33
+#define DEVICE_INFO_FEEDBACK_GAP       34
 
 #define ARM_CONTROLS_PROTOCOL_VERSION_MAJOR 1
 #define ARM_CONTROLS_PROTOCOL_VERSION_MINOR 1
@@ -78,6 +79,7 @@
 #define ARM_CONTROLS_CAP_GRAVITY_COMP        (1 << 2)
 #define ARM_CONTROLS_CAP_FORCE_FEEDBACK      (1 << 3)
 #define ARM_CONTROLS_CAP_MOVE_TO_READY       (1 << 4)
+#define ARM_CONTROLS_CAP_NO_RECOVERY_MOTION  (1 << 5)
 
 // Source enum for DEVICE_INFO_READY_MOVE_IN_PROGRESS param_int[0]. Concrete devices pass
 // these via Device::publish_ready_move_progress() so Python can distinguish startup vs

@@ -43,7 +43,14 @@ class TestDevice : public Device {
     ReturnCode operate_as_follower() override { return ReturnCode::SUCCESS; }
     ReturnCode get_servo_ids(std::vector<int>&) override { return ReturnCode::SUCCESS; }
     ReturnCode set_control_mode(Role, ControlModeIntent) override { return ReturnCode::SUCCESS; }
+    ReturnCode park_safely() override { ++park_count; return ReturnCode::SUCCESS; }
 
+    void expire_client_watchdog() {
+        is_ready_ = true;
+        last_client_heartbeat_ = std::chrono::steady_clock::now() - std::chrono::seconds(6);
+        check_client_heartbeat_watchdog();
+    }
+    int park_count = 0;
     int joint_action_count = 0;
     int joystick_action_count = 0;
     int follower_action_count = 0;
@@ -255,6 +262,61 @@ TEST(TopicZmqStep, StopDoesNotDispatchQueuedJointCommand) {
     EXPECT_EQ(device.joint_action_count, 0);
 }
 
+TEST(TopicZmqStep, HoldDiscardsAlreadyQueuedJointCommand) {
+    CommandLineArgs cla = make_cla();
+    TestDevice device(cla, 1);
+    TopicZmq topic(&device, cla, 0, nullptr);
+    topic.set_pause_leader_command_listening(false);
+
+    topic.sub_command_.close();
+    topic.sub_command_ = zmq::socket_t(topic.context_, ZMQ_PAIR);
+    const std::string lifecycle_endpoint =
+        "inproc://topic_zmq_step_stop_lifecycle_" + cla.device_id;
+    topic.sub_command_.bind(lifecycle_endpoint);
+    zmq::socket_t lifecycle_sender(topic.context_, ZMQ_PAIR);
+    lifecycle_sender.connect(lifecycle_endpoint);
+
+    topic.sub_joint_.close();
+    topic.sub_joint_ = zmq::socket_t(topic.context_, ZMQ_PAIR);
+    const std::string joint_endpoint =
+        "inproc://topic_zmq_step_stop_joint_" + cla.device_id;
+    topic.sub_joint_.bind(joint_endpoint);
+    zmq::socket_t joint_sender(topic.context_, ZMQ_PAIR);
+    joint_sender.connect(joint_endpoint);
+
+    ZmqCommand stop{};
+    stop.command = DEVICE_COMMAND_HOLD;
+    lifecycle_sender.send(
+        zmq::buffer(topic.topic_lifecycle_), zmq::send_flags::sndmore);
+    lifecycle_sender.send(zmq::buffer(&stop, sizeof(stop)), zmq::send_flags::none);
+
+    ZmqJointInfo joint{};
+    joint.msg_type = static_cast<int>(MsgType::JOINT_INFO);
+    joint.joint_num = 1;
+    joint_sender.send(zmq::buffer(topic.topic_joint_), zmq::send_flags::sndmore);
+    joint_sender.send(zmq::buffer(&joint, sizeof(joint)), zmq::send_flags::none);
+
+    EXPECT_EQ(topic.step(), ReturnCode::SUCCESS);
+    EXPECT_EQ(device.joint_action_count, 0);
+}
+
+TEST(TopicZmqStep, StrictStopParksBeforeReturning) {
+    CommandLineArgs cla = make_cla();
+    cla.no_recovery_motion = true;
+    TestDevice device(cla, 1);
+    class ExposedTopic : public TopicZmq {
+       public:
+        using TopicZmq::TopicZmq;
+        using Topic::process_leader_msg;
+    };
+    ExposedTopic topic(&device, cla, 0, nullptr);
+    MsgCommand stop{};
+    stop.command_ = DEVICE_COMMAND_STOP;
+    EXPECT_EQ(topic.process_leader_msg(stop), ReturnCode::SUCCESS);
+    EXPECT_EQ(device.park_count, 1);
+    EXPECT_FALSE(topic.is_running());
+}
+
 TEST(TopicZmqStep, ReportsMalformedJointPayload) {
     CommandLineArgs cla = make_cla();
     TestDevice device(cla, 1);
@@ -388,3 +450,18 @@ TEST(TopicZmqInitializationDeathTest, RejectsNegativeControlFrequency) {
 }
 
 }  // namespace
+
+TEST(StrictClientWatchdog, ExpiredClientHeartbeatParksOnceWithoutRecovery) {
+    auto cla = make_cla(); cla.no_recovery_motion = true;
+    TestDevice device(cla, 1);
+    // This unit test covers terminal retirement after an armed watchdog expires.
+    // Process startup arming and exit codes require the separate node/client harness.
+    device.note_client_heartbeat();
+    device.expire_client_watchdog();
+    EXPECT_EQ(device.park_count, 1);
+    EXPECT_TRUE(device.is_in_emergency_recovery());
+    EXPECT_TRUE(device.rejects_direct_commands());
+    device.expire_client_watchdog();
+    EXPECT_EQ(device.park_count, 1);
+    EXPECT_EQ(device.joint_action_count, 0);
+}

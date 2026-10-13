@@ -27,7 +27,6 @@ class DeviceFR3 final : public Device {
     ReturnCode operate_as_follower() override;
     ReturnCode get_servo_ids(std::vector<int>& servo_ids) override;
     ReturnCode set_control_mode(Role target_role, ControlModeIntent intent) override;
-    ReturnCode runtime_hold(bool feedback_gap = false) override;
 
    protected:
     void reset_ready_state_for_move_to_ready() override { is_ready_ = false; }
